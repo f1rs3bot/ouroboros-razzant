@@ -1,0 +1,1082 @@
+"""Out-of-process execution for native-risk extension skills.
+
+The host process may safely catalog and dispatch extensions whose isolated
+dependencies include native wheels: plugin import and handler execution happen
+in a per-call child process, so Rust/C aborts cannot take down server.py.
+HTTP response children live through streaming and cleanup; one-shot calls keep
+their existing timeout and result-size contracts.
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+
+import asyncio
+import base64
+import inspect
+import json
+import logging
+import os
+import pathlib
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+import weakref
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, List
+
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+
+from ouroboros.config import EXTENSION_CHILD_CLEANUP_GRACE_SEC
+from ouroboros.provider_models import MODEL_PROVIDER_CREDENTIAL_KEYS
+from ouroboros.platform_layer import (
+    merge_hidden_kwargs, posix_signal_name, subprocess_new_group_kwargs,
+)
+from ouroboros.skill_loader import find_skill, grant_status_for_skill, skill_state_dir
+from ouroboros.tools.process_facts import publish_process_facts
+from ouroboros.tools.registry import ToolContext
+from ouroboros.tools.shell import _active_subprocesses, _kill_process_group, _subprocess_lock
+from ouroboros.tools.skill_exec import _scrub_env
+from ouroboros.usage_accounting import current_usage_scope, record_unmetered_external_dispatch
+from ouroboros.utils import sanitize_tool_result_for_log
+
+log = logging.getLogger(__name__)
+
+_NATIVE_SUFFIXES = {".so", ".pyd", ".dylib", ".dll"}
+_STDOUT_CAP = 512 * 1024
+_STDERR_CAP = 128 * 1024
+_INPUT_CAP = 1024 * 1024
+_RESULT_CAP = 512 * 1024
+_CATALOG_TIMEOUT_SEC = 30
+_RUNTIME_MODE_ENV_KEYS = ("OUROBOROS_BOOT_RUNTIME_MODE", "OUROBOROS_RUNTIME_MODE")
+_POSIX_SIGABRT = 6
+
+
+class ExtensionProcessError(RuntimeError):
+    """A child extension process failed without crashing the host."""
+
+    def __init__(self, message: str, *, failure_kind: str = "error") -> None:
+        super().__init__(message)
+        self.failure_kind = failure_kind
+
+
+def _format_child_returncode(returncode: int) -> str:
+    """Render child deaths in operator-readable form without trusting stderr."""
+
+    try:
+        code = int(returncode)
+    except (TypeError, ValueError):
+        return f"returncode={returncode}"
+    if code < 0:
+        signum = -code
+        sig_name = posix_signal_name(signum)
+        return f"signal={sig_name}({signum}), returncode={code}"
+    if code >= 128:
+        signum = code - 128
+        sig_name = posix_signal_name(signum)
+        if sig_name:
+            return f"signal={sig_name}({signum}), returncode={code}"
+    return f"returncode={code}"
+
+
+def _quiet_python_abort() -> None:
+    """Terminate a macOS extension child without asking CrashReporter for a dialog."""
+
+    try:
+        sys.stderr.write("Ouroboros extension child intercepted os.abort(); exiting quietly with code 134.\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(134)
+
+
+def _quiet_sigabrt(signum, _frame) -> None:
+    """Exit from child SIGABRT handlers instead of letting macOS show a crash dialog."""
+
+    try:
+        raw_signum = int(signum or signal.SIGABRT)
+    except Exception:
+        raw_signum = _POSIX_SIGABRT
+    exit_signum = _POSIX_SIGABRT if raw_signum == int(signal.SIGABRT) else raw_signum
+    try:
+        sys.stderr.write(f"Ouroboros extension child intercepted SIGABRT({raw_signum}); exiting quietly.\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(128 + exit_signum)
+
+
+def _bootstrap_quiet_child_crash_reporting() -> Dict[str, Any]:
+    """Best-effort macOS child-only crash UX guard before plugin import."""
+
+    status: Dict[str, Any] = {"enabled": False, "platform": sys.platform, "actions": [], "warnings": []}
+    if sys.platform != "darwin" or os.environ.get("OUROBOROS_EXTENSION_PROCESS_CHILD") != "1":
+        return status
+    status["enabled"] = True
+    try:
+        import resource
+
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        status["actions"].append("disable_core_dumps")
+    except Exception as exc:
+        status["warnings"].append(f"core_dump_limit_failed:{type(exc).__name__}")
+    try:
+        signal.signal(signal.SIGABRT, _quiet_sigabrt)
+        status["actions"].append("quiet_sigabrt_handler")
+    except Exception as exc:
+        status["warnings"].append(f"sigabrt_handler_failed:{type(exc).__name__}")
+    try:
+        os.abort = _quiet_python_abort  # type: ignore[method-assign]
+        status["actions"].append("quiet_python_os_abort")
+    except Exception as exc:
+        status["warnings"].append(f"os_abort_patch_failed:{type(exc).__name__}")
+    if status["warnings"]:
+        try:
+            sys.stderr.write(
+                "Ouroboros extension child quiet-crash bootstrap warning: "
+                + ", ".join(status["warnings"])
+                + "\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+    return status
+
+
+def extension_has_native_deps(skill_dir: pathlib.Path) -> bool:
+    """Return True if a skill payload or isolated env contains native modules."""
+
+    root = pathlib.Path(skill_dir)
+    try:
+        for path in root.rglob("*"):
+            if path.is_file() and path.suffix.lower() in _NATIVE_SUFFIXES:
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def extension_requires_process_isolation(skill_dir: pathlib.Path, dependency_site_dirs_enabled: bool) -> bool:
+    """Policy hook for native-risk extension isolation."""
+
+    return bool(dependency_site_dirs_enabled) or extension_has_native_deps(skill_dir)
+
+
+def _json_safe(value: Any) -> Any:
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        if isinstance(value, dict):
+            return {str(k): _json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [_json_safe(v) for v in value]
+        return str(value)
+
+
+def _write_child_result(payload: Dict[str, Any], result: Dict[str, Any]) -> None:
+    raw_result_path = str(payload.get("result_path") or "")
+    if not raw_result_path:
+        return
+    result_path = pathlib.Path(raw_result_path)
+    _write_private_json(result_path, result, cap_bytes=_RESULT_CAP)
+
+
+def _ensure_private_dir(path: pathlib.Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+
+
+def _write_private_json(path: pathlib.Path, payload: Dict[str, Any], *, cap_bytes: int | None = None, overflow_error: str | None = None) -> None:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if cap_bytes is not None and len(data) > cap_bytes:
+        if overflow_error:
+            raise ExtensionProcessError(overflow_error)
+        data = json.dumps(
+            {"ok": False, "error": "extension child protocol result exceeded safety cap"},
+            ensure_ascii=False,
+        ).encode("utf-8")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fd = -1
+            fh.write(data)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _tool_context_payload(ctx: ToolContext) -> Dict[str, Any]:
+    return {
+        "task_id": str(ctx.task_id or ""),
+        "current_chat_id": ctx.current_chat_id,
+        "current_task_type": str(ctx.current_task_type or ""),
+        "drive_root": str(ctx.drive_root or ""),
+        "workspace_root": str(ctx.workspace_root or ""),
+        "workspace_mode": str(ctx.workspace_mode or ""),
+        "memory_mode": str(ctx.memory_mode or ""),
+        "budget_drive_root": str(getattr(ctx, "budget_drive_root", "") or ""),
+        "project_id": str(getattr(ctx, "project_id", "") or ""),
+        "task_depth": int(ctx.task_depth or 0),
+        "task_metadata": _json_safe(dict(ctx.task_metadata or {})),
+        "task_contract": _json_safe(dict(getattr(ctx, "task_contract", {}) or {})),
+    }
+
+
+def _apply_tool_context_payload(ctx: ToolContext, payload: Dict[str, Any]) -> ToolContext:
+    ctx.task_id = str(payload.get("task_id") or "") or None
+    raw_chat_id = payload.get("current_chat_id")
+    ctx.current_chat_id = raw_chat_id if isinstance(raw_chat_id, int) else None
+    ctx.current_task_type = str(payload.get("current_task_type") or "") or None
+    raw_drive_root = str(payload.get("drive_root") or "")
+    if raw_drive_root:
+        ctx.drive_root = pathlib.Path(raw_drive_root)
+    workspace_root = str(payload.get("workspace_root") or "")
+    ctx.workspace_root = pathlib.Path(workspace_root) if workspace_root else None
+    ctx.workspace_mode = str(payload.get("workspace_mode") or "")
+    ctx.memory_mode = str(payload.get("memory_mode") or "")
+    ctx.budget_drive_root = str(payload.get("budget_drive_root") or "")
+    ctx.project_id = str(payload.get("project_id") or "")
+    try:
+        ctx.task_depth = int(payload.get("task_depth") or 0)
+    except (TypeError, ValueError):
+        ctx.task_depth = 0
+    task_metadata = payload.get("task_metadata")
+    ctx.task_metadata = dict(task_metadata) if isinstance(task_metadata, dict) else {}
+    task_contract = payload.get("task_contract")
+    ctx.task_contract = dict(task_contract) if isinstance(task_contract, dict) else {}
+    return ctx
+
+
+def _child_python() -> str:
+    return sys.executable
+
+
+def _child_env(
+    *,
+    drive_root: pathlib.Path,
+    repo_dir: pathlib.Path,
+    skill_name: str,
+    skill_dir: pathlib.Path,
+    env_allowlist: List[str],
+    granted_keys: List[str],
+) -> Dict[str, str]:
+    env = _scrub_env(env_allowlist, skill_state_dir(drive_root, skill_name), skill_name, granted_keys=granted_keys)
+    env["OUROBOROS_APP_ROOT"] = str(pathlib.Path(drive_root).parent)
+    env["OUROBOROS_SETTINGS_PATH"] = str(pathlib.Path(drive_root) / "settings.json")
+    env["OUROBOROS_DATA_DIR"] = str(drive_root)
+    env["OUROBOROS_REPO_DIR"] = str(repo_dir)
+    env["OUROBOROS_EXTENSION_PROCESS_CHILD"] = "1"
+    for key in _RUNTIME_MODE_ENV_KEYS:
+        if os.environ.get(key):
+            env[key] = str(os.environ[key])
+    # WA6: carry bytecode suppression into the scrubbed child env so an extension
+    # subprocess running the embedded python never writes __pycache__/*.pyc into a
+    # signed+notarized macOS .app bundle (which would break the codesign seal).
+    for key in ("PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX"):
+        if os.environ.get(key):
+            env[key] = str(os.environ[key])
+    pythonpath = str(repo_dir)
+    if env.get("PYTHONPATH"):
+        pythonpath = os.pathsep.join([pythonpath, env["PYTHONPATH"]])
+    env["PYTHONPATH"] = pythonpath
+    env["PYTHONUNBUFFERED"] = "1"
+    # Host Service loopback access so an out-of-process child/companion can relay
+    # WS progress (send_ws_message) and subscribe to host events. Reserved and
+    # non-overridable by the skill; token is per-skill, content-hash bound.
+    try:
+        from ouroboros.extension_loader import mint_skill_token
+        from ouroboros.gateway.host_service import DEFAULT_HOST_SERVICE_HOST, host_service_port
+
+        token = mint_skill_token(skill_state_dir(drive_root, skill_name), skill_name, skill_dir)
+        if token:
+            env["HOST_SERVICE_TOKEN"] = token
+            env["HOST_SERVICE_URL"] = f"http://{DEFAULT_HOST_SERVICE_HOST}:{host_service_port()}"
+    except Exception:
+        pass
+    return env
+
+
+def _drain(pipe: Any, cap: int, out: bytearray, overflow: Dict[str, bool], label: str, *, discard_excess: bool = False) -> None:
+    try:
+        while True:
+            chunk = pipe.read(4096)
+            if not chunk:
+                return
+            remaining = cap - len(out)
+            if remaining <= 0:
+                overflow[label] = True
+                if discard_excess:
+                    continue
+                return
+            out.extend(chunk[:remaining])
+            if len(chunk) > remaining:
+                overflow[label] = True
+                if not discard_excess:
+                    return
+    except (OSError, ValueError):
+        return
+
+
+_CHILD_SPAWNED_ATTR = "_ouroboros_extension_child_spawned"
+
+# Fallback registry for exception objects that refuse the attribute (e.g. an
+# overriding __setattr__): the spawn fact must be recorded once the child
+# exists, so the marker read consults this side-table too. The table is keyed
+# by id() with a weakref finalizer purging the entry, so it is IDENTITY-safe
+# and never depends on the exception being hashable or well-behaved under
+# __eq__ (a WeakSet would TypeError on an unhashable exception — on add AND
+# on the membership check — and could false-positive an equal-but-distinct
+# one), and marked exceptions never leak (the entry dies with the object,
+# before its id can be reused). An object that ALSO refuses weak references
+# cannot carry the fact at all — that theoretical residue is logged, never
+# silently dropped.
+_spawned_marker_fallback: Dict[int, "weakref.ref[BaseException]"] = {}
+_spawned_marker_lock = threading.Lock()
+
+
+def extension_child_was_spawned(exc: BaseException) -> bool:
+    """ABI-9 typed post-Popen fact: True only when the extension child process
+    was actually started before ``exc`` was raised. ``_run_child`` stamps the
+    marker on every exception that crosses the spawn boundary; a pre-spawn
+    failure — payload staging, dispatch resolve/load/env, the ``Popen`` call
+    itself — carries no marker, so dispatch provenance never records a
+    ``physical_dispatch`` for a child that never existed.
+
+    FAIL-CLOSED read: this is called from ``except`` handlers, so a broken
+    marker check (a hostile ``__getattr__``, whatever else the exception
+    object does) must never raise — it would REPLACE the original in-flight
+    error — and must never claim a physical dispatch it cannot prove."""
+    try:
+        try:
+            if bool(getattr(exc, _CHILD_SPAWNED_ATTR, False)):
+                return True
+        except Exception:
+            # A hostile __getattr__ only fires when the attribute was never
+            # SET (a set attribute is found by normal lookup first), so the
+            # probe failure falls through to exactly where the marker would
+            # then live: the identity side-table.
+            pass
+        with _spawned_marker_lock:
+            ref = _spawned_marker_fallback.get(id(exc))
+        # The referent identity check makes a stale or colliding id entry
+        # (impossible for live objects, cheap to rule out anyway) inert.
+        return ref is not None and ref() is exc
+    except Exception:
+        return False
+
+
+def _fallback_mark_spawned(exc: BaseException) -> None:
+    key = id(exc)
+
+    def _purge(_ref: "weakref.ref[BaseException]", *, _key: int = key) -> None:
+        with _spawned_marker_lock:
+            _spawned_marker_fallback.pop(_key, None)
+
+    ref = weakref.ref(exc, _purge)
+    with _spawned_marker_lock:
+        _spawned_marker_fallback[key] = ref
+
+
+def _mark_child_spawned(exc: BaseException) -> BaseException:
+    try:
+        setattr(exc, _CHILD_SPAWNED_ATTR, True)
+    except Exception:  # attribute refused: use the identity side-table
+        try:
+            _fallback_mark_spawned(exc)
+        except Exception:
+            log.warning(
+                "extension spawn marker could not be attached to %s",
+                type(exc).__name__,
+            )
+    return exc
+
+
+def _publish_child_facts(
+    proc: Any, started_ts: float, *, timed_out: bool = False,
+    killed_by_host: bool = False, ws_relay_failures=None, skill_name: str = "",
+) -> None:
+    """Publish the extension child's typed process facts to the call's channel.
+
+    The out-of-process extension child is a child of the tool call exactly like
+    a ``run_command`` subprocess, and the loop merges this thread's publication
+    into that call's ``result_meta``. Before this, an extension child's death
+    was legible only as prose in the error text — the dispatcher stamped typed
+    CODES (EXTENSION_TIMEOUT / EXTENSION_ERROR) but never an exit code or a
+    signal. A host kill is published with the code the child had at the moment
+    of the kill (often absent, since the reap happens in the caller's finally),
+    plus the kill facts, which is the whole truth on Windows too.
+    """
+    try:
+        facts = publish_process_facts(
+            returncode=proc.poll(),
+            started_ts=started_ts,
+            timed_out=timed_out,
+            killed_by_host=killed_by_host,
+            ws_relay_failures=ws_relay_failures,
+        )
+        if facts.get("ws_relay_failures"):
+            log.warning("extension child WS relay failures for %s (best effort): %s", skill_name, facts["ws_relay_failures"])
+    except Exception:  # never replace an in-flight child failure
+        log.debug("extension child process facts could not be published", exc_info=True)
+
+
+@contextmanager
+def _child_process(
+    payload: Dict[str, Any], *, skill_dir: pathlib.Path, drive_root: pathlib.Path,
+    repo_dir: pathlib.Path, env: Dict[str, str],
+    on_spawn: Callable[[], None] | None = None, stream: bool = False,
+):
+    """One staging, spawn, registration and cleanup owner for every child mode."""
+    calls_dir = skill_state_dir(drive_root, str(payload.get("skill_name") or "")) / "extension_calls"
+    _ensure_private_dir(calls_dir)
+    input_path = calls_dir / f"{uuid.uuid4().hex}.json"
+    result_path = calls_dir / f"{uuid.uuid4().hex}.result.json"
+    import_root_base = calls_dir / f"{uuid.uuid4().hex}.imports"
+    payload = dict(payload)
+    payload["result_path"] = str(result_path)
+    _write_private_json(
+        input_path,
+        payload,
+        cap_bytes=_INPUT_CAP,
+        overflow_error="extension child protocol input exceeded safety cap",
+    )
+    env = dict(env)
+    env["OUROBOROS_EXTENSION_IMPORT_ROOT_BASE"] = str(import_root_base)
+    cmd = [_child_python(), "-m", "ouroboros.extension_process_runner", str(input_path)]
+    kwargs: Dict[str, Any] = {
+        "cwd": str(repo_dir),
+        "env": env,
+        "stdin": subprocess.PIPE if stream else subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+    }
+    kwargs.update(subprocess_new_group_kwargs())
+    try:
+        proc = subprocess.Popen(cmd, **merge_hidden_kwargs(kwargs))  # noqa: S603 - argv is host-constructed
+    except BaseException:
+        try:
+            input_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    child_started_ts = time.monotonic()
+    # ABI-9 spawn boundary: from here on the child EXISTS. Every exception
+    # leaving this function — process registration, the on_spawn durable
+    # disclosure, the drain/poll/result protocol, even a cleanup failure in
+    # the finally block — must carry the spawned marker, or dispatch
+    # provenance would record no physical_dispatch for a child that ran.
+    try:
+        with _subprocess_lock:
+            _active_subprocesses.add(proc)
+        if stream:
+            from ouroboros.process_custody import record_process
+            record_process(drive_root, pid=proc.pid, cmd=cmd,
+                           purpose=f"extension_route:{payload.get('skill_name')}", scope="session")
+        if on_spawn is not None:
+            # Popen has already dispatched the child.  A failed durable
+            # disclosure must stop it rather than leave an untracked external
+            # execution: the finally block below kills and reaps the child.
+            on_spawn()
+        yield SimpleNamespace(proc=proc, result_path=result_path, started_ts=child_started_ts)
+    except BaseException as exc:
+        # Everything in this block runs AFTER Popen: the typed marker lets the
+        # dispatcher stamp physical_dispatch on real post-spawn failures only.
+        raise _mark_child_spawned(exc)
+    finally:
+        try:
+            try:
+                if proc.poll() is None:
+                    _kill_process_group(proc)
+                proc.wait(timeout=EXTENSION_CHILD_CLEANUP_GRACE_SEC)
+            except Exception:
+                pass
+            with _subprocess_lock:
+                _active_subprocesses.discard(proc)
+            try:
+                input_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                result_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            shutil.rmtree(import_root_base, ignore_errors=True)
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                try:
+                    if pipe:
+                        pipe.close()
+                except OSError:
+                    pass
+        except BaseException as cleanup_exc:
+            # A cleanup failure must never REPLACE a marked in-flight
+            # exception with an unmarked one (nor itself escape unmarked on
+            # the success path): the replacing exception carries the marker
+            # too — the child really did run.
+            raise _mark_child_spawned(cleanup_exc)
+
+
+def _run_child(
+    payload: Dict[str, Any], *, skill_dir: pathlib.Path, drive_root: pathlib.Path,
+    repo_dir: pathlib.Path, env: Dict[str, str], timeout_sec: int,
+    on_spawn: Callable[[], None] | None = None,
+) -> Dict[str, Any]:
+    with _child_process(payload, skill_dir=skill_dir, drive_root=drive_root,
+                        repo_dir=repo_dir, env=env, on_spawn=on_spawn) as child:
+        proc, result_path = child.proc, child.result_path
+        child_started_ts = child.started_ts
+        stdout = bytearray()
+        stderr = bytearray()
+        overflow = {"stdout": False, "stderr": False}
+        out_thread = threading.Thread(target=_drain, args=(proc.stdout, _STDOUT_CAP, stdout, overflow, "stdout"), daemon=True)
+        err_thread = threading.Thread(target=_drain, args=(proc.stderr, _STDERR_CAP, stderr, overflow, "stderr"), daemon=True)
+        out_thread.start()
+        err_thread.start()
+        deadline = time.monotonic() + max(1, int(timeout_sec))
+        while proc.poll() is None:
+            if overflow["stdout"] or overflow["stderr"]:
+                _kill_process_group(proc)
+                _publish_child_facts(proc, child_started_ts, killed_by_host=True)
+                raise ExtensionProcessError("extension child output exceeded safety cap")
+            if time.monotonic() >= deadline:
+                _kill_process_group(proc)
+                _publish_child_facts(
+                    proc, child_started_ts, timed_out=True, killed_by_host=True,
+                )
+                raise ExtensionProcessError(
+                    f"extension child timed out after {timeout_sec}s",
+                    failure_kind="timeout",
+                )
+            time.sleep(0.05)
+        out_thread.join(timeout=EXTENSION_CHILD_CLEANUP_GRACE_SEC)
+        err_thread.join(timeout=EXTENSION_CHILD_CLEANUP_GRACE_SEC)
+        _publish_child_facts(proc, child_started_ts)
+        if proc.returncode != 0:
+            stderr_text = stderr.decode("utf-8", errors="replace").strip()
+            safe_stderr = sanitize_tool_result_for_log(stderr_text)[-2000:] if stderr_text else ""
+            code_detail = _format_child_returncode(int(proc.returncode or 0))
+            detail = f"{code_detail}; {safe_stderr}" if safe_stderr else code_detail
+            raise ExtensionProcessError(f"extension child exited abnormally: {detail}")
+        if not result_path.exists():
+            raise ExtensionProcessError("extension child did not write protocol result")
+        if result_path.stat().st_size > _RESULT_CAP:
+            raise ExtensionProcessError("extension child protocol result exceeded safety cap")
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8") or "{}")
+        except json.JSONDecodeError as exc:
+            raise ExtensionProcessError(f"extension child returned invalid JSON: {exc}") from exc
+        _publish_child_facts(proc, child_started_ts, ws_relay_failures=result.get("ws_relay_failures"),
+                             skill_name=str(payload.get("skill_name") or ""))
+        if not result.get("ok", False):
+            raise ExtensionProcessError(str(result.get("error") or "extension child failed"))
+        return dict(result)
+
+
+def _record_extension_dispatch(
+    *,
+    dispatch_id: str,
+    drive_root: pathlib.Path,
+    skill_name: str,
+    surface_kind: str,
+    surface: str,
+    ctx: ToolContext | None = None,
+) -> str:
+    """Disclose one spawned extension child outside core model metering."""
+
+    bound = current_usage_scope()
+    meta = getattr(ctx, "task_metadata", {}) if ctx is not None else {}
+    meta = meta if isinstance(meta, dict) else {}
+    task_id = str(
+        (getattr(ctx, "task_id", "") if ctx is not None else "")
+        or meta.get("task_id")
+        or meta.get("subagent_task_id")
+        or (bound.task_id if bound is not None else "")
+        or ""
+    )
+    system_root = f"extension:{skill_name}"
+    root_task_id = str(
+        meta.get("root_task_id")
+        or (getattr(ctx, "root_task_id", "") if ctx is not None else "")
+        or (bound.root_task_id if bound is not None else "")
+        or task_id
+        or system_root
+    )
+    if not task_id:
+        task_id = root_task_id
+    parent_task_id = str(
+        meta.get("parent_task_id")
+        or (getattr(ctx, "parent_task_id", "") if ctx is not None else "")
+        or (bound.parent_task_id if bound is not None else "")
+        or ""
+    )
+    return record_unmetered_external_dispatch(
+        dispatch_id,
+        drive_root=pathlib.Path(drive_root).resolve(strict=False),
+        provider="external-extension",
+        task_id=task_id,
+        root_task_id=root_task_id,
+        parent_task_id=parent_task_id,
+        category="external_skill",
+        source=f"extension_{surface_kind}:{skill_name}:{surface}",
+    )
+
+
+def disclose_inprocess_extension_dispatch(
+    spec: Dict[str, Any],
+    *,
+    drive_root: pathlib.Path,
+    surface_kind: str,
+    surface: str,
+    ctx: ToolContext | None = None,
+) -> str:
+    """Record one admitted in-process handler that can bypass core metering."""
+    probe = spec.get("_model_credential_probe")
+    if not callable(probe) or not probe():
+        return ""
+    return _record_extension_dispatch(
+        dispatch_id=f"extension:{surface_kind}:{uuid.uuid4().hex}",
+        drive_root=pathlib.Path(drive_root),
+        skill_name=str(spec.get("skill") or "unknown"),
+        surface_kind=surface_kind,
+        surface=surface,
+        ctx=ctx,
+    )
+
+
+def _base_env_for_skill(skill: Any, drive_root: pathlib.Path, repo_dir: pathlib.Path) -> Dict[str, str]:
+    return _child_env(
+        drive_root=drive_root,
+        repo_dir=repo_dir,
+        skill_name=skill.name,
+        skill_dir=skill.skill_dir,
+        env_allowlist=[],
+        granted_keys=[],
+    )
+
+
+def _extension_has_model_credentials(skill: Any, drive_root: pathlib.Path) -> bool:
+    """Whether an OOP extension can actually read a funded model credential."""
+    grants = grant_status_for_skill(pathlib.Path(drive_root), skill)
+    granted = {str(key).strip().upper() for key in (grants.get("granted_keys") or [])}
+    manifest = getattr(skill, "manifest", None)
+    permissions = {str(item).strip() for item in (getattr(manifest, "permissions", None) or [])}
+    allowed = {
+        str(item).strip().upper()
+        for item in (getattr(manifest, "env_from_settings", None) or [])
+        if str(item).strip()
+    }
+    candidates = granted & allowed & MODEL_PROVIDER_CREDENTIAL_KEYS
+    if "read_settings" not in permissions or not candidates:
+        return False
+    from ouroboros.config import load_settings
+
+    settings = load_settings()
+    return any(str(settings.get(key) or "").strip() for key in candidates)
+
+
+def catalog_extension_surfaces(skill: Any, *, drive_root: pathlib.Path, repo_dir: pathlib.Path, skills_repo_path: pathlib.Path | None = None) -> Dict[str, Any]:
+    env = _base_env_for_skill(skill, pathlib.Path(drive_root), pathlib.Path(repo_dir))
+    model_capable = _extension_has_model_credentials(skill, pathlib.Path(drive_root))
+    dispatch_id = f"extension:catalog:{uuid.uuid4().hex}"
+    return _run_child(
+        {
+            "mode": "catalog",
+            "skill_name": skill.name,
+            "drive_root": str(drive_root),
+            "repo_dir": str(repo_dir),
+            "skills_repo_path": str(skills_repo_path or skill.skill_dir.parent),
+        },
+        skill_dir=skill.skill_dir,
+        drive_root=pathlib.Path(drive_root),
+        repo_dir=pathlib.Path(repo_dir),
+        env=env,
+        timeout_sec=_CATALOG_TIMEOUT_SEC,
+        on_spawn=(
+            lambda: _record_extension_dispatch(
+                dispatch_id=dispatch_id,
+                drive_root=pathlib.Path(drive_root),
+                skill_name=skill.name,
+                surface_kind="catalog",
+                surface="register",
+            )
+        ) if model_capable else None,
+    )
+
+
+def dispatch_extension_tool_subprocess(ext_tool: Dict[str, Any], ctx: ToolContext, args: Dict[str, Any]) -> str:
+    meta = getattr(ctx, "task_metadata", {})
+    bound = current_usage_scope()
+    dispatch_drive_root = pathlib.Path(
+        (meta.get("budget_drive_root") if isinstance(meta, dict) else "")
+        or getattr(ctx, "budget_drive_root", "")
+        or (bound.drive_root if bound is not None else "")
+        or getattr(ctx, "drive_root", "")
+        or "."
+    ).resolve(strict=False)
+    skill = _skill_for_dispatch(
+        str(ext_tool.get("skill") or ""),
+        dispatch_drive_root,
+        pathlib.Path(str(ext_tool.get("skills_repo_path") or ctx.repo_dir)),
+    )
+    env = _base_env_for_skill(skill, dispatch_drive_root, pathlib.Path(ctx.repo_dir))
+    model_capable = _extension_has_model_credentials(skill, dispatch_drive_root)
+    dispatch_id = f"extension:tool:{uuid.uuid4().hex}"
+    result = _run_child(
+        {
+            "mode": "tool",
+            "skill_name": skill.name,
+            "surface": str(ext_tool.get("name") or ""),
+            "args": dict(args or {}),
+            "ctx": _tool_context_payload(ctx),
+            "drive_root": str(dispatch_drive_root),
+            "repo_dir": str(ctx.repo_dir),
+            "skills_repo_path": str(ext_tool.get("skills_repo_path") or ctx.repo_dir),
+        },
+        skill_dir=skill.skill_dir,
+        drive_root=dispatch_drive_root,
+        repo_dir=pathlib.Path(ctx.repo_dir),
+        env=env,
+        timeout_sec=max(1, int(ext_tool.get("timeout_sec") or 60)),
+        on_spawn=((
+            lambda: _record_extension_dispatch(
+                dispatch_id=dispatch_id,
+                drive_root=dispatch_drive_root,
+                skill_name=skill.name,
+                surface_kind="tool",
+                surface=str(ext_tool.get("name") or ""),
+                ctx=ctx,
+            )
+        ) if model_capable else None),
+    )
+    return str(result.get("result") or "")
+
+
+def dispatch_extension_route_subprocess(spec: Dict[str, Any], request_payload: Dict[str, Any], *, drive_root: pathlib.Path, repo_dir: pathlib.Path) -> Response:
+    skills_repo_path = pathlib.Path(str(spec.get("skills_repo_path") or repo_dir))
+    skill = _skill_for_dispatch(str(spec.get("skill") or ""), pathlib.Path(drive_root), skills_repo_path)
+    env = _base_env_for_skill(skill, pathlib.Path(drive_root), pathlib.Path(repo_dir))
+    model_capable = _extension_has_model_credentials(skill, pathlib.Path(drive_root))
+    dispatch_id = f"extension:route:{uuid.uuid4().hex}"
+    from functools import partial
+    from ouroboros.extension_route_stream import RouteStreamResponse
+
+    child_factory = partial(_child_process,
+        {
+            "mode": "route",
+            "skill_name": skill.name,
+            "surface": str(spec.get("path") or ""),
+            "request": request_payload,
+            "drive_root": str(drive_root),
+            "repo_dir": str(repo_dir),
+            "skills_repo_path": str(skills_repo_path),
+        },
+        skill_dir=skill.skill_dir,
+        drive_root=pathlib.Path(drive_root),
+        repo_dir=pathlib.Path(repo_dir),
+        env=env,
+        stream=True,
+        on_spawn=((
+            lambda: _record_extension_dispatch(
+                dispatch_id=dispatch_id,
+                drive_root=pathlib.Path(drive_root),
+                skill_name=skill.name,
+                surface_kind="route",
+                surface=str(spec.get("path") or ""),
+            )
+        ) if model_capable else None),
+    )
+
+    return RouteStreamResponse(spec, child_factory)
+
+
+def dispatch_extension_ws_subprocess(spec: Dict[str, Any], msg: Dict[str, Any], *, drive_root: pathlib.Path, repo_dir: pathlib.Path) -> Any:
+    skills_repo_path = pathlib.Path(str(spec.get("skills_repo_path") or repo_dir))
+    skill = _skill_for_dispatch(str(spec.get("skill") or ""), pathlib.Path(drive_root), skills_repo_path)
+    env = _base_env_for_skill(skill, pathlib.Path(drive_root), pathlib.Path(repo_dir))
+    model_capable = _extension_has_model_credentials(skill, pathlib.Path(drive_root))
+    dispatch_id = f"extension:ws:{uuid.uuid4().hex}"
+    result = _run_child(
+        {
+            "mode": "ws",
+            "skill_name": skill.name,
+            "surface": str(spec.get("type") or ""),
+            "message": dict(msg or {}),
+            "drive_root": str(drive_root),
+            "repo_dir": str(repo_dir),
+            "skills_repo_path": str(skills_repo_path),
+        },
+        skill_dir=skill.skill_dir,
+        drive_root=pathlib.Path(drive_root),
+        repo_dir=pathlib.Path(repo_dir),
+        env=env,
+        timeout_sec=max(1, int(spec.get("timeout_sec") or 60)),
+        on_spawn=((
+            lambda: _record_extension_dispatch(
+                dispatch_id=dispatch_id,
+                drive_root=pathlib.Path(drive_root),
+                skill_name=skill.name,
+                surface_kind="ws",
+                surface=str(spec.get("type") or ""),
+            )
+        ) if model_capable else None),
+    )
+    return result.get("result")
+
+
+def _skill_for_dispatch(skill_name: str, drive_root: pathlib.Path, skills_repo_path: pathlib.Path) -> Any:
+    skill = find_skill(drive_root, skill_name, repo_path=str(skills_repo_path))
+    if skill is None:
+        raise ExtensionProcessError(f"extension skill {skill_name!r} is missing")
+    return skill
+
+
+def _load_child_extension(skill_name: str, drive_root: pathlib.Path, repo_dir: pathlib.Path, skills_repo_path: pathlib.Path) -> Any:
+    from ouroboros.config import load_settings
+    from ouroboros.extension_loader import load_extension
+    from ouroboros.skill_loader import discover_skills
+
+    skills = discover_skills(drive_root, repo_path=str(skills_repo_path))
+    skill = next((item for item in skills if item.name == skill_name), None)
+    if skill is None:
+        raise ExtensionProcessError(f"extension skill {skill_name!r} is missing")
+    err = load_extension(
+        skill,
+        load_settings,
+        drive_root=drive_root,
+        skills=skills,
+        repo_path=str(skills_repo_path),
+        _force_in_process=True,
+    )
+    if err:
+        raise ExtensionProcessError(err)
+    return skill
+
+
+def _surface_catalog() -> Dict[str, Any]:
+    from ouroboros.extension_loader import get_tool, list_companion_names, list_routes, list_ws_handlers, snapshot
+
+    snap = snapshot()
+    return {
+        "companions": list_companion_names(),
+        "tools": [
+            {
+                key: _json_safe(value)
+                for key, value in (get_tool(name) or {}).items()
+                if key != "handler"
+            }
+            for name in snap.get("tools", [])
+        ],
+        "routes": [
+            {
+                key: _json_safe(value)
+                for key, value in spec.items()
+                if key != "handler"
+            }
+            for spec in list_routes().values()
+        ],
+        "ws_handlers": [
+            {
+                key: _json_safe(value)
+                for key, value in spec.items()
+                if key != "handler"
+            }
+            for spec in list_ws_handlers().values()
+        ],
+        "ui_tabs": snap.get("ui_tabs", []),
+        "settings_sections": snap.get("settings_sections", []),
+    }
+
+
+async def _run_maybe_async(value: Any) -> Any:
+    if inspect.iscoroutine(value):
+        return await value
+    return value
+
+
+async def _call_tool(surface: str, args: Dict[str, Any], drive_root: pathlib.Path, repo_dir: pathlib.Path, ctx_payload: Dict[str, Any] | None = None) -> Any:
+    from ouroboros.extension_loader import get_tool
+
+    tool = get_tool(surface)
+    if not tool or not callable(tool.get("handler")):
+        raise ExtensionProcessError(f"extension tool {surface!r} is not registered")
+    handler = tool["handler"]
+    ctx = _apply_tool_context_payload(
+        ToolContext(repo_dir=repo_dir, drive_root=drive_root),
+        dict(ctx_payload or {}),
+    )
+    # ctx calling-convention from the descriptor (decided on the RAW handler at
+    # register time); fall back to inspecting the unwrapped handler for legacy
+    # tools registered before the flag existed.
+    _wants = tool.get("wants_ctx")
+    if _wants is None:
+        _wants = _handler_wants_ctx(inspect.unwrap(handler))
+    result = (
+        handler(ctx, **dict(args or {}))
+        if _wants
+        else handler(**dict(args or {}))
+    )
+    return await _run_maybe_async(result)
+
+
+def _handler_wants_ctx(handler: Any) -> bool:
+    """True when the handler's first parameter is a ctx slot (canonical form).
+
+    Extension tool handlers are either ``fn(ctx, **args)`` (canonical) or
+    ``fn(**args)`` / ``fn(named=...)`` (ctx-less). Dispatch on the first
+    parameter's name so the args dict can still bind named parameters.
+    """
+    import inspect
+
+    try:
+        params = list(inspect.signature(handler).parameters.values())
+    except (TypeError, ValueError):
+        return True  # builtins/C callables: keep the historical ctx-first call
+    if not params:
+        return False
+    first = params[0]
+    if first.kind == first.VAR_POSITIONAL:
+        return True
+    if first.kind in (first.POSITIONAL_ONLY, first.POSITIONAL_OR_KEYWORD):
+        return first.name in {"ctx", "context", "_ctx", "tool_context"}
+    return False
+
+
+async def _request_from_payload(payload: Dict[str, Any], drive_root: pathlib.Path, repo_dir: pathlib.Path, disconnect=None) -> Request:
+    body = base64.b64decode(str(payload.get("body_b64") or ""))
+    sent = False
+
+    async def receive() -> Dict[str, Any]:
+        nonlocal sent
+        if sent:
+            if disconnect is not None:
+                return await disconnect()
+            return {"type": "http.request", "body": b"", "more_body": False}
+        sent = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    headers = [
+        (str(k).lower().encode("latin-1", errors="ignore"), str(v).encode("latin-1", errors="ignore"))
+        for k, v in (payload.get("headers") or [])
+    ]
+    scope = {
+        "type": "http",
+        "method": str(payload.get("method") or "GET").upper(),
+        "path": str(payload.get("path") or "/"),
+        "query_string": str(payload.get("query_string") or "").encode("utf-8"),
+        "headers": headers,
+        "path_params": dict(payload.get("path_params") or {}),
+        "app": SimpleNamespace(state=SimpleNamespace(drive_root=drive_root, repo_dir=repo_dir)),
+        "scheme": "http",
+        "server": ("127.0.0.1", 0),
+        "client": ("127.0.0.1", 0),
+    }
+    return Request(scope, receive)
+
+
+async def _call_route(surface: str, request_payload: Dict[str, Any], drive_root: pathlib.Path,
+                      repo_dir: pathlib.Path, skill: Any, channel: Any) -> None:
+    from ouroboros.extension_loader import list_routes
+    from ouroboros.extension_isolated_deps import async_isolated_site_dirs_scope
+    from ouroboros.skill_dependencies import auto_install_specs_for_skill
+
+    channel.bind()
+    spec = list_routes().get(surface)
+    if not spec or not callable(spec.get("handler")):
+        raise ExtensionProcessError(f"extension route {surface!r} is not registered")
+    request = await _request_from_payload(request_payload, drive_root, repo_dir, channel.receive)
+    result = await _run_maybe_async(spec["handler"](request))
+    if not isinstance(result, Response):
+        result = JSONResponse(_json_safe(result)) if isinstance(result, (dict, list)) else Response(str(result))
+    # Handler scope ended before its lazy body/background runs. The child owns
+    # this skill's response scope too, so delayed dependency imports still work.
+    async with async_isolated_site_dirs_scope(skill.skill_dir,
+            enabled=bool(auto_install_specs_for_skill(drive_root, skill))):
+        await result(request.scope, request.receive, channel.send)
+
+
+async def _call_ws(surface: str, msg: Dict[str, Any]) -> Any:
+    from ouroboros.extension_loader import list_ws_handlers
+
+    spec = list_ws_handlers().get(surface)
+    if not spec or not callable(spec.get("handler")):
+        raise ExtensionProcessError(f"extension WS handler {surface!r} is not registered")
+    return await _run_maybe_async(spec["handler"](dict(msg or {})))
+
+
+def _child_main(input_path: str) -> None:
+    from ouroboros.extension_plugin_api import take_child_ws_relay_failures
+
+    payload = json.loads(pathlib.Path(input_path).read_text(encoding="utf-8"))
+    drive_root = pathlib.Path(payload["drive_root"])
+    repo_dir = pathlib.Path(payload["repo_dir"])
+    skills_repo_path = pathlib.Path(payload.get("skills_repo_path") or repo_dir)
+    skill_name = str(payload["skill_name"])
+    take_child_ws_relay_failures()
+    mode = str(payload.get("mode") or "")
+    channel = None
+    if mode == "route":
+        from ouroboros.extension_route_stream import ChildResponseChannel
+        channel = ChildResponseChannel()
+    _bootstrap_quiet_child_crash_reporting()
+    try:
+        skill = _load_child_extension(skill_name, drive_root, repo_dir, skills_repo_path)
+        if mode == "catalog":
+            result = _surface_catalog()
+        elif mode == "tool":
+            result = {"result": _json_safe(asyncio.run(_call_tool(str(payload.get("surface") or ""), dict(payload.get("args") or {}), drive_root, repo_dir, dict(payload.get("ctx") or {}))))}
+        elif mode == "route":
+            asyncio.run(_call_route(str(payload.get("surface") or ""), dict(payload.get("request") or {}), drive_root, repo_dir, skill, channel))
+        elif mode == "ws":
+            result = {"result": _json_safe(asyncio.run(_call_ws(str(payload.get("surface") or ""), dict(payload.get("message") or {}))))}
+        else:
+            raise ExtensionProcessError(f"unknown extension child mode {mode!r}")
+        if channel is None:
+            outcome = {"ok": True, **result}
+    except BaseException as exc:
+        if channel is not None:
+            try:
+                channel.error(exc)
+            except OSError:
+                pass
+        else:
+            outcome = {"ok": False, "error": sanitize_tool_result_for_log(f"{type(exc).__name__}: {exc}")}
+    finally:
+        try:
+            from ouroboros.extension_loader import unload_extension
+            unload_extension(skill_name)
+        except Exception as exc:
+            if channel is not None:
+                try:
+                    channel.error(exc)
+                except OSError:
+                    pass
+        failures = take_child_ws_relay_failures()
+        if channel is not None:
+            try:
+                channel.finish(failures)
+            except OSError:
+                pass
+        else:
+            if failures:
+                outcome["ws_relay_failures"] = failures
+            _write_child_result(payload, outcome)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: python -m ouroboros.extension_process_runner <payload.json>")
+    try:
+        from ouroboros.process_custody import start_parent_lifeline
+
+        start_parent_lifeline(label="extension-runner")
+    except Exception:
+        pass
+    _child_main(sys.argv[1])

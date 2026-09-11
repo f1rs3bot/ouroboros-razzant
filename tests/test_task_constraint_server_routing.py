@@ -1,0 +1,271 @@
+from types import SimpleNamespace
+import asyncio
+from pathlib import Path
+
+import server
+from ouroboros.gateway import control as gateway_control
+
+
+class FakeBridge:
+    def get_updates(self, offset, timeout=1):
+        return [{
+            "update_id": 1,
+            "message": {
+                "chat": {"id": 1},
+                "from": {"id": 1},
+                "text": "repair skill",
+                "task_constraint": {"mode": "skill_repair", "skill_name": "alpha", "payload_root": "skills/external/alpha"},
+                "suppress_chat_log": True,
+            },
+        }]
+
+    def broadcast(self, payload):
+        pass
+
+
+def test_constrained_repair_promotes_managed_task_before_busy_ephemeral_lane(monkeypatch):
+    calls = {"inject": 0, "ephemeral": [], "direct": [], "promote": [], "sent": []}
+    agent = SimpleNamespace(_busy=True, inject_message=lambda *a, **k: calls.__setitem__("inject", calls["inject"] + 1))
+    ctx = SimpleNamespace(
+        load_state=lambda: {"owner_id": 1},
+        save_state=lambda st: None,
+        update_state=lambda mutator: (lambda st: (mutator(st), st)[1])({"owner_id": 1}),
+        consciousness=SimpleNamespace(inject_observation=lambda *_: None, pause=lambda: None, resume=lambda: None),
+        get_chat_agent=lambda: agent,
+        send_with_budget=lambda chat_id, text: calls["sent"].append((chat_id, text)),
+        handle_chat_direct=lambda cid, txt, img, task_constraint=None, task_metadata=None: calls["direct"].append(task_constraint),
+        handle_chat_ephemeral=lambda cid, txt, img, task_constraint=None, task_metadata=None: calls["ephemeral"].append(task_constraint),
+    )
+    monkeypatch.setattr(
+        "supervisor.events._handle_promote_chat_to_task",
+        lambda event, _ctx: (
+            calls["promote"].append(event)
+            or {"status": "scheduled", "task_id": event["task_id"]}
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_reserved_project_for_chat",
+        lambda *_: (_ for _ in ()).throw(AssertionError("repair must route before project lookup")),
+    )
+    class ImmediateThread:
+        def __init__(self, target, args=(), kwargs=None, daemon=False):
+            self.target = target
+            self.args = args
+            self.kwargs = kwargs or {}
+        def start(self):
+            self.target(*self.args, **self.kwargs)
+    monkeypatch.setattr(server.threading, "Thread", ImmediateThread)
+
+    server._process_bridge_updates(FakeBridge(), 0, ctx)
+
+    assert calls["inject"] == 0
+    assert calls["direct"] == []
+    assert calls["ephemeral"] == []
+    assert len(calls["promote"]) == 1
+    event = calls["promote"][0]
+    assert event["type"] == "promote_chat_to_task"
+    assert event["task_constraint"] == {
+        "mode": "skill_repair",
+        "skill_name": "alpha",
+        "payload_root": "skills/external/alpha",
+    }
+    assert event["origin_suppressed"] is True
+    assert len(calls["sent"]) == 1
+    assert calls["sent"][0][0] == 1
+    assert "accepted and durably scheduled" in calls["sent"][0][1]
+
+
+def test_constrained_repair_refusal_is_reported_to_owner(monkeypatch):
+    sent = []
+    ctx = SimpleNamespace(
+        consciousness=SimpleNamespace(inject_observation=lambda *_: None),
+        send_with_budget=lambda chat_id, text: sent.append((chat_id, text)),
+    )
+    monkeypatch.setattr(
+        "supervisor.events._handle_promote_chat_to_task",
+        lambda event, _ctx: {
+            "status": "needs_manual_target",
+            "reason": "skill_repair_payload_missing",
+            "task_id": event["task_id"],
+        },
+    )
+
+    server._route_owner_message(
+        FakeBridge(),
+        ctx,
+        {
+            "chat_id": 1,
+            "text": "repair skill",
+            "client_message_id": "repair-1",
+            "task_constraint": {
+                "mode": "skill_repair",
+                "skill_name": "alpha",
+                "payload_root": "skills/external/alpha",
+            },
+        },
+    )
+
+    assert len(sent) == 1
+    assert sent[0][0] == 1
+    assert "skill_repair_payload_missing" in sent[0][1]
+
+
+def test_repair_ui_copy_does_not_promise_a_removed_decision_round():
+    repo = Path(__file__).resolve().parent.parent
+    for path in (repo / "web/modules/skills.js", repo / "web/modules/marketplace.js"):
+        text = path.read_text(encoding="utf-8")
+        assert "Ouroboros will decide" not in text
+        assert "If the task cannot start, chat will show why" in text
+        assert "confirmLabel: 'Repair and run'" in text
+        assert "visible_text:" not in text
+
+
+def test_ordinary_busy_message_uses_native_lane(monkeypatch):
+    calls = {"ephemeral": [], "direct": []}
+    bridge = FakeBridge()
+    bridge.get_updates = lambda offset, timeout=1: [{
+        "update_id": 2,
+        "message": {
+            "chat": {"id": 1},
+            "from": {"id": 1},
+            "text": "ordinary follow-up",
+            "suppress_chat_log": True,
+        },
+    }]
+    ctx = SimpleNamespace(
+        load_state=lambda: {"owner_id": 1},
+        save_state=lambda st: None,
+        update_state=lambda mutator: (lambda st: (mutator(st), st)[1])({"owner_id": 1}),
+        consciousness=SimpleNamespace(inject_observation=lambda *_: None, pause=lambda: None, resume=lambda: None),
+        get_chat_agent=lambda: SimpleNamespace(_busy=True),
+        handle_chat_direct=lambda *args, **kwargs: calls["direct"].append((args, kwargs)),
+        handle_chat_ephemeral=lambda *args, **kwargs: calls["ephemeral"].append((args, kwargs)),
+    )
+
+    class ImmediateThread:
+        def __init__(self, target, args=(), kwargs=None, daemon=False):
+            self.target = target
+            self.args = args
+            self.kwargs = kwargs or {}
+
+        def start(self):
+            self.target(*self.args, **self.kwargs)
+
+    monkeypatch.setattr(server.threading, "Thread", ImmediateThread)
+
+    server._process_bridge_updates(bridge, 0, ctx)
+
+    assert calls["ephemeral"] == []
+    assert len(calls["direct"]) == 1
+
+
+def test_visible_repair_command_is_deduped(monkeypatch):
+    calls = []
+
+    class Request:
+        async def json(self):
+            return {
+                "cmd": "repair",
+                "visible_text": "Repair task queued",
+                "visible_task_id": "skill_repair_alpha",
+                "task_constraint": {"mode": "skill_repair", "skill_name": "alpha", "payload_root": "skills/external/alpha"},
+            }
+
+    class Bridge:
+        def ui_send(self, text, **kwargs):
+            calls.append((text, kwargs))
+
+    monkeypatch.setattr(gateway_control, "_RECENT_VISIBLE_COMMANDS", {})
+    monkeypatch.setattr("supervisor.message_bus.get_bridge", lambda: Bridge())
+    monkeypatch.setattr("supervisor.message_bus.log_chat", lambda *a, **k: None)
+    monkeypatch.setattr(gateway_control, "broadcast_ws_sync", lambda payload: None)
+
+    first = asyncio.run(gateway_control.api_command(Request()))
+    second = asyncio.run(gateway_control.api_command(Request()))
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert len(calls) == 1
+
+
+def test_failed_visible_repair_command_does_not_poison_dedupe(monkeypatch):
+    calls = []
+    bridges = []
+
+    class Request:
+        async def json(self):
+            return {
+                "cmd": "repair",
+                "visible_text": "Repair task queued",
+                "visible_task_id": "skill_repair_alpha",
+                "task_constraint": {"mode": "skill_repair", "skill_name": "alpha", "payload_root": "skills/external/alpha"},
+            }
+
+    class FailingBridge:
+        def ui_send(self, text, **kwargs):
+            raise RuntimeError("bus down")
+
+    class HealthyBridge:
+        def ui_send(self, text, **kwargs):
+            calls.append((text, kwargs))
+
+    bridges.extend([FailingBridge(), HealthyBridge()])
+    monkeypatch.setattr(gateway_control, "_RECENT_VISIBLE_COMMANDS", {})
+    monkeypatch.setattr("supervisor.message_bus.get_bridge", lambda: bridges.pop(0))
+    monkeypatch.setattr("supervisor.message_bus.log_chat", lambda *a, **k: None)
+    monkeypatch.setattr(gateway_control, "broadcast_ws_sync", lambda payload: None)
+
+    first = asyncio.run(gateway_control.api_command(Request()))
+    second = asyncio.run(gateway_control.api_command(Request()))
+
+    assert first.status_code == 400
+    assert second.status_code == 200
+    assert len(calls) == 1
+
+
+def test_visible_repair_command_can_retry_after_short_dedupe_window(monkeypatch):
+    calls = []
+    now = {"value": 100.0}
+
+    class Request:
+        async def json(self):
+            return {
+                "cmd": "repair",
+                "visible_text": "Repair task queued",
+                "visible_task_id": "skill_repair_alpha",
+                "task_constraint": {"mode": "skill_repair", "skill_name": "alpha", "payload_root": "skills/external/alpha"},
+            }
+
+    class Bridge:
+        def ui_send(self, text, **kwargs):
+            calls.append((text, kwargs))
+
+    monkeypatch.setattr(gateway_control, "_RECENT_VISIBLE_COMMANDS", {})
+    monkeypatch.setattr(gateway_control.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr("supervisor.message_bus.get_bridge", lambda: Bridge())
+    monkeypatch.setattr("supervisor.message_bus.log_chat", lambda *a, **k: None)
+    monkeypatch.setattr(gateway_control, "broadcast_ws_sync", lambda payload: None)
+
+    first = asyncio.run(gateway_control.api_command(Request()))
+    now["value"] += gateway_control._VISIBLE_COMMAND_DEDUPE_SEC + 0.1
+    second = asyncio.run(gateway_control.api_command(Request()))
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert len(calls) == 2
+
+
+def test_scoped_task_metadata_derives_project_from_chat_id():
+    """chat_id is the SSOT for thread→project (full project awareness, v6.32.0):
+    a registered project chat scopes task_metadata to its OWN project, OVERRIDING
+    any client-supplied project_id; a non-project chat DROPS an untrusted client
+    project_id; metadata is otherwise preserved (None stays None)."""
+    # Registered project chat: override a mismatched client project_id.
+    assert server._scoped_task_metadata("proj_a", {"project_id": "proj_b", "x": 1}) == {"project_id": "proj_a", "x": 1}
+    # Registered project chat with no client value: set it.
+    assert server._scoped_task_metadata("proj_a", None) == {"project_id": "proj_a"}
+    # Non-project chat: drop an untrusted client project_id, keep the rest.
+    assert server._scoped_task_metadata("", {"project_id": "proj_b", "x": 1}) == {"x": 1}
+    # Non-project chat, nothing to scope: unchanged (None preserved).
+    assert server._scoped_task_metadata("", None) is None
