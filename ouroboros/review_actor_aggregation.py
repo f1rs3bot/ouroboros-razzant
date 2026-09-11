@@ -63,7 +63,7 @@ def aggregate_review_actors(
     actors: List[Any],
     slots_by_id: Dict[str, Any],
     actor_projection: Callable[[Any, str], Dict[str, Any]],
-    criteria_shape_valid: Callable[[Any, str], bool],
+    criteria_shape_valid: Callable[[Any], bool],
     advisory_hardness: str,
 ) -> Dict[str, Any]:
     """Apply participation, tier-contract, quorum, and enforcement semantics."""
@@ -113,7 +113,7 @@ def aggregate_review_actors(
             if isinstance(parsed, dict) else ""
         )
         criteria = parsed.get("criteria_used") if isinstance(parsed, dict) else None
-        criteria_ok = criteria_shape_valid(criteria, tier)
+        criteria_ok = criteria_shape_valid(criteria)
         contract_ok = (
             tier in valid_tiers
             and (

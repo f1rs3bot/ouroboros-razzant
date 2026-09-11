@@ -18,7 +18,6 @@ from ouroboros.review_substrate import (
     task_acceptance_is_clean,
     ReviewRequest,
     ReviewSlot,
-    OUTCOME_TIER_SOLVED,
 )
 from ouroboros.review_evidence import build_task_acceptance_evidence, _ACCEPT_RESULT_CAP
 from ouroboros.tool_capabilities import DEFAULT_TOOL_RESULT_LIMIT
@@ -26,31 +25,35 @@ from ouroboros.tool_capabilities import DEFAULT_TOOL_RESULT_LIMIT
 
 # ── 1.2 partial coherence: an honest partial no longer becomes "malformed" ──────
 
-def test_criteria_shape_valid_partial_at_non_solved_tier_is_valid():
-    partial = [{"criterion": "c", "status": "partial"}]
-    # honest partial contributes as a valid NON-clean vote at best_effort
-    assert _criteria_shape_valid(partial, "best_effort") is True
-    assert _criteria_shape_valid(partial, "blocked_with_evidence") is True
-    # ...but NOT at solved (incoherent — solved still requires all supported)
-    assert _criteria_shape_valid(partial, "solved") is False
+def test_criteria_shape_valid_is_shape_only_at_every_tier():
+    # v7.0.1: an honest partial/missing/rejected criterion is a VALID shape at ANY tier,
+    # 'solved' included. The tier answers "was the objective achieved"; the criteria
+    # answer "which criteria are evidenced"; their coherence is the RELEASE-CLEAN bar
+    # (task_acceptance_is_clean), never the parse axis. The v6.71.1 fix closed the
+    # non-solved tiers of this quorum-starvation class; this closes the 'solved' half.
+    for status in ("partial", "missing", "rejected"):
+        row = [{"criterion": "c", "status": status}]
+        assert _criteria_shape_valid(row) is True
+        # ...and the clean bar still refuses every one of them.
+        assert _criteria_have_supported_evidence(row) is False
 
 
-def test_criteria_shape_valid_solved_still_requires_all_supported_with_refs():
+def test_criteria_shape_valid_keeps_the_supported_requires_refs_rule():
     supported = [{"criterion": "c", "status": "supported", "evidence_refs": ["r"]}]
-    assert _criteria_shape_valid(supported, "solved") is True
-    # solved coherence is exactly the release-clean bar (unchanged)
+    assert _criteria_shape_valid(supported) is True
+    # the all-supported-with-refs coherence now lives ONLY in the clean bar
     assert _criteria_have_supported_evidence(supported) is True
-    # supported without refs is invalid at any tier
+    # supported without refs stays a SHAPE violation — the rule this predicate keeps
     assert _criteria_shape_valid(
-        [{"criterion": "c", "status": "supported"}], OUTCOME_TIER_SOLVED
+        [{"criterion": "c", "status": "supported"}]
     ) is False
 
 
 def test_criteria_shape_valid_rejects_bad_shape():
-    assert _criteria_shape_valid([], "best_effort") is False
-    assert _criteria_shape_valid([{"criterion": "", "status": "partial"}], "best_effort") is False
-    assert _criteria_shape_valid([{"criterion": "c", "status": "weird"}], "best_effort") is False
-    assert _criteria_shape_valid("notalist", "best_effort") is False
+    assert _criteria_shape_valid([]) is False
+    assert _criteria_shape_valid([{"criterion": "", "status": "partial"}]) is False
+    assert _criteria_shape_valid([{"criterion": "c", "status": "weird"}]) is False
+    assert _criteria_shape_valid("notalist") is False
 
 
 # ── 1.1 rebuttal wire: the reviewer sees the host obligation catalog + rule ──────
@@ -278,6 +281,56 @@ class _HonestPartialLLM:
             "findings": [],
             "summary": "honest partial",
         })}, {}
+
+
+class _SolvedWithHonestGapLLM:
+    """The PRODUCTION shape (task 82ee0a16f03444d6): the objective IS solved, but the
+    reviewer honestly marks one criterion unmet. All three live reviewers produced
+    exactly this, were stamped parse_status=malformed, and collapsed the quorum to 0/2
+    while the host reported "reviewers did not reach a valid quorum"."""
+
+    def chat(self, **_kwargs):
+        return {"content": json.dumps({
+            "verdict": "PASS",
+            "outcome_tier": "solved",
+            "completion_coach": "record the portal's own submission response as the receipt",
+            "criteria_used": [
+                {"criterion": "objective achieved", "status": "supported",
+                 "evidence_refs": ["verification_summary"]},
+                {"criterion": "parallel sub-agents on separate vectors", "status": "partial"},
+            ],
+            "findings": [],
+            "summary": "solved with one honest process gap",
+        })}, {}
+
+
+def test_solved_pass_with_an_honest_gap_criterion_still_contributes(tmp_path):
+    """Regression for the production failure (v7.0.1): a 'solved' verdict beside an
+    honestly-marked criterion is a VALID judgement and must vote — the gap costs only
+    the clean bit. Before this, a unanimous honest gap was reported to the owner as a
+    review-infrastructure failure."""
+    result = run_review_request(
+        ReviewRequest(
+            surface="task_acceptance",
+            goal="g",
+            policy={
+                "min_successful_slots": 2,
+                "classify_outcome_tier": True,
+                "require_criterion_evidence": True,
+            },
+            task_id="root",
+        ),
+        slots=[ReviewSlot(slot_id=f"s{i}", model=f"m{i}") for i in range(3)],
+        drive_root=tmp_path,
+        llm=_SolvedWithHonestGapLLM(),
+    )
+    assert result.aggregate_signal == "PASS"           # the honest verdict VOTES
+    assert result.degraded is False
+    assert not any(
+        "missing_tier_coach_or_criterion_evidence" in reason
+        for reason in result.degraded_reasons
+    )
+    assert task_acceptance_is_clean(result) is False   # ...and is never release-clean
 
 
 def test_honest_partial_pass_contributes_at_coordinator_level(tmp_path):

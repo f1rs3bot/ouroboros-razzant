@@ -48,18 +48,28 @@ def _criteria_have_supported_evidence(criteria: Any) -> bool:
     ))
 
 
-def _criteria_shape_valid(criteria: Any, tier: str) -> bool:
-    """Shape + tier coherence for a reviewer's criteria_used (v6.71.1).
+def _criteria_shape_valid(criteria: Any) -> bool:
+    """SHAPE validity for a reviewer's criteria_used — and nothing else.
 
-    SHAPE: a non-empty list of {criterion, status ∈ enum}, and every 'supported'
-    criterion names evidence_refs. COHERENCE: 'solved' still requires ALL criteria
-    'supported' with refs — the release-clean bar (task_acceptance_is_clean) is
-    unchanged; a non-solved tier (best_effort / blocked_with_evidence) may honestly
-    carry partial/missing/rejected criteria. This lets an honest PASS that marks one
-    criterion 'partial' contribute as a valid NON-clean vote instead of being demoted
-    to parse_status=malformed — the old all-must-be-'supported' gate (the prompt itself
-    offers 'partial') silently starved the honest-partial path and fueled acceptance
-    loops (BIBLE P2/P3; the FAIL-veto and clean-solved contracts are untouched)."""
+    A non-empty list of {criterion, status ∈ enum}, where every 'supported'
+    criterion names evidence_refs. ``tier`` is deliberately NOT a parameter (v7.0.1):
+    the coherence between a 'solved' tier and an all-supported criteria list is the
+    RELEASE-CLEAN bar, and its one owner is ``task_acceptance_is_clean`` (via
+    ``_criteria_have_supported_evidence``), which reads the same list at the
+    authority point.
+
+    Why the parameter is gone rather than merely ignored: a response that declares
+    'solved' while honestly marking one criterion partial/missing/rejected is a VALID
+    reviewer judgement — the tier answers "was the objective achieved", ``criteria_used``
+    answers "which criteria are evidenced", and the two can legitimately disagree.
+    Asking the coherence question HERE re-asked the clean question on the PARSE axis and
+    answered it by stamping ``parse_status="malformed"`` and dropping the vote, so a
+    unanimous honest gap collapsed the quorum and the host reported "reviewers did not
+    reach a valid quorum" — a false statement about reviewers that had in fact agreed.
+    The v6.71.1 fix for this same quorum-starvation class closed the non-solved tiers
+    and left the 'solved' half open; this closes it. A criterion-level deficiency now
+    costs the CLEAN contribution — exactly as ``criteria_refs_unresolved`` does — and
+    never the vote. The FAIL-veto and clean-solved contracts are untouched."""
     if not (isinstance(criteria, list) and criteria):
         return False
     for item in criteria:
@@ -72,8 +82,6 @@ def _criteria_shape_valid(criteria: Any, tier: str) -> bool:
             return False
         if status == "supported" and not item.get("evidence_refs"):
             return False
-    if str(tier or "").strip().lower() == OUTCOME_TIER_SOLVED:
-        return _criteria_have_supported_evidence(criteria)
     return True
 
 

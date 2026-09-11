@@ -10,6 +10,7 @@ from ouroboros.review_substrate import (
     ReviewSlot,
     build_improvement_capsule,
     run_review_request,
+    task_acceptance_is_clean,
 )
 from ouroboros import task_pacing
 from ouroboros.usage_accounting import _claim_physical_dispatch
@@ -989,7 +990,9 @@ def test_clean_acceptance_requires_per_criterion_evidence(tmp_path):
         drive_root=tmp_path,
         llm=_CriterionLLM(structured=True, status="missing"),
     )
-    assert missing.aggregate_signal == "DEGRADED"
+    # v7.0.1: a non-supported status is a valid SHAPE (the coherence is the clean bar's), so this contributes yet is not clean.
+    assert missing.aggregate_signal == "PASS"
+    assert task_acceptance_is_clean(missing) is False
     clean = run_review_request(
         request, slots=slots, drive_root=tmp_path, llm=_CriterionLLM(structured=True),
     )
