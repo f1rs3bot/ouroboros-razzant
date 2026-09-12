@@ -31,6 +31,12 @@ _ADDED_OWNERS = {
     "model_role_option": model_slots,
     "task_model_binding": model_slots,
     "apply_model_role_override": model_slots,
+    "ROUTE_LIMIT_FALLBACK_KEY": model_slots,
+    "ROUTE_LIMIT_FALLBACK_ALLOW": model_slots,
+    "ROUTE_LIMIT_FALLBACK_DENY": model_slots,
+    "ROUTE_LIMIT_ERROR_KINDS": model_slots,
+    "get_limit_fallback_policy": model_slots,
+    "limit_blocks_fallback": model_slots,
     "CLAUDEXOR_MODEL_POLL_INTERVAL_SEC": runtime_limits,
 }
 

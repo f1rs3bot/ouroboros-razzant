@@ -66,6 +66,7 @@ from ouroboros.loop_transport import (
     fallback_chain_allowed as _fallback_chain_allowed,
     finalize_now_transport_terminal as _finalize_now_transport_terminal,  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
     last_assistant_text as _last_assistant_text,
+    limit_denial_evidence as _limit_denial_evidence,
     provider_terminal_fallback_text as _provider_terminal_fallback_text,
     reconcile_transport_wait as _reconcile_transport_wait,
     task_deadline_epoch as _task_deadline_epoch,  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
@@ -552,7 +553,10 @@ def run_llm_loop(
             transport_wait = _reconcile_transport_wait(
                 transport_wait, ctx, msg_present=msg is not None, error_kind=last_error_kind,
                 drive_logs=drive_logs, task_id=task_id, model=active_model, emit_progress=emit_progress)
-            if msg is None and _fallback_chain_allowed(ctx, last_error_kind, transport_wait, accumulated_usage):
+            if msg is None and _fallback_chain_allowed(
+                ctx, last_error_kind, transport_wait, accumulated_usage,
+                _limit_denial_evidence(drive_logs, task_id, active_model, last_error_kind, round_idx),
+            ):
                 _episode_before_chain = transport_wait is not None
                 (
                     msg,

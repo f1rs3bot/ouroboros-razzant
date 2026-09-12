@@ -315,6 +315,12 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_FALLBACK_COOLDOWN_ENABLED": True,
     "OUROBOROS_FALLBACK_COOLDOWN_SEC": 120,
     "OUROBOROS_FALLBACK_ATTEMPTS_PER_MODEL": 1,
+    # May a ROUTE LIMIT be answered by spending on the cross-model chain? `allow` (shipped)
+    # is exactly the pre-existing decision; `deny` refuses to substitute another (possibly
+    # metered) route on a limit, so a backup route is entered only when the owner asks. The
+    # knob is one-directional (it can deny a rotation, never enable one) and the enum SSOT
+    # plus the closed limit-kind set live in model_slots.py.
+    "OUROBOROS_ROUTE_LIMIT_FALLBACK": "allow",
     # Delegated subagents. NARROW key, read ONLY by the subagent scheduler; deliberately absent from
     # provider_models.MODEL_SETTING_KEYS (see ARCHITECTURE "Delegated subagents"). Empty = delegation off AND
     # undecided (Settings' Subagents section offers the connected-subscription default); the literal `off` =

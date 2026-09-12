@@ -306,6 +306,67 @@ def get_fallback_models(active_model: str = "") -> list[str]:
     return out
 
 
+# May a ROUTE LIMIT be answered by the cross-model chain? ``allow`` (shipped) is
+# exactly the pre-existing decision — the chain may substitute another route.
+# ``deny`` refuses that substitution, so a metered backup route is never entered
+# on a limit without the owner asking for it. ONE-DIRECTIONAL by construction: it
+# can deny a rotation the gate would otherwise permit, and can never enable one
+# the pre-existing rules exclude. The knob's NAME says what it does — it denies a
+# fallback; it does not park and wait (a denied round reaches the existing
+# provider-unavailable terminal).
+ROUTE_LIMIT_FALLBACK_KEY = "OUROBOROS_ROUTE_LIMIT_FALLBACK"
+ROUTE_LIMIT_FALLBACK_ALLOW = "allow"
+ROUTE_LIMIT_FALLBACK_DENY = "deny"
+
+# The closed set of error kinds a route LIMIT can arrive as, each producer named
+# so a new one is a visible edit here rather than a silent widening:
+#   provider_transient            -- loop_llm_call.classify_llm_exception
+#                                    (408 / 429 / 5xx / overloaded, and the
+#                                    _RETRYABLE_PROVIDER_CODES members)
+#   rate_limit                    -- llm_openai_compatible: an HTTP-200 body
+#                                    error carrying a 429
+#   subscription_window_exhausted -- classify_llm_exception's typed window
+#                                    refusal (loop_llm_call.SUBSCRIPTION_WINDOW_EXHAUSTED,
+#                                    carrying its reset instant)
+# Deliberately EXCLUDES the content-policy refusal, the empty-response glitch,
+# auth / bad_request / quota (402) / request_too_large and context overflow:
+# those are not route limits. Folding the content-policy refusal in is exactly
+# how the rejected 7.1.0 candidate silently removed a rotation that already
+# worked.
+ROUTE_LIMIT_ERROR_KINDS = frozenset({
+    "provider_transient",
+    "rate_limit",
+    "subscription_window_exhausted",
+})
+
+
+def get_limit_fallback_policy() -> str:
+    """The owner's route-limit fallback policy, clamped to the closed enum.
+
+    Unset, empty, unknown or malformed resolves to the shipped default
+    (``allow`` = the pre-change behaviour), never to a spend posture the owner
+    did not choose. Reads the environment, which ``apply_settings_to_env`` fills
+    from the settings floor, so a fresh install needs no file.
+    """
+    raw = str(os.environ.get(ROUTE_LIMIT_FALLBACK_KEY, "") or "").strip().lower()
+    if not raw:
+        raw = str(SETTINGS_DEFAULTS.get(ROUTE_LIMIT_FALLBACK_KEY, ROUTE_LIMIT_FALLBACK_ALLOW) or "").strip().lower()
+    return raw if raw in (ROUTE_LIMIT_FALLBACK_ALLOW, ROUTE_LIMIT_FALLBACK_DENY) else ROUTE_LIMIT_FALLBACK_ALLOW
+
+
+def limit_blocks_fallback(error_kind: str) -> bool:
+    """Whether the owner's policy forbids answering this kind with another route.
+
+    True only for a member of :data:`ROUTE_LIMIT_ERROR_KINDS` while the owner
+    selected ``deny``; every other kind keeps its decision whatever the policy
+    says, which is what makes the shipped default a byte-for-byte no-op.
+    """
+    return (
+        str(error_kind or "") in ROUTE_LIMIT_ERROR_KINDS
+        and get_limit_fallback_policy() == ROUTE_LIMIT_FALLBACK_DENY
+    )
+
+
 # v6.39 slot rename-alias migration (same shape as the retention-key rename):
 # OUROBOROS_MODEL_CODE -> _HEAVY, USE_LOCAL_CODE -> USE_LOCAL_HEAVY,
 # OUROBOROS_MODEL_FALLBACK -> _FALLBACKS.

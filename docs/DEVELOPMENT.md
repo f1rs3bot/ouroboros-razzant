@@ -2173,6 +2173,15 @@ by "Provider Independence" above. Call-site imperatives:
   readable reasoning stays failover-eligible for every family so one
   endpoint's outage does not strand valid work
   (`tests/test_llm_provider_routing.py`).
+- A second, owner-selected disable exists and is deliberately never inferred:
+  `OUROBOROS_ROUTE_LIMIT_FALLBACK=deny` refuses the cross-model chain for a
+  route LIMIT only (`ouroboros/model_slots.ROUTE_LIMIT_ERROR_KINDS`), ships as
+  the pre-change `allow`, can only deny and never widen, and discloses each
+  policy-caused denial as `route_limit_policy_denied`. Changing a policy
+  DEFAULT is exactly how a capability regression lands with every test green:
+  `tests/test_route_limit_policy.py` freezes the pre-change decision for every
+  error kind and a new producer kind fails its scan until it is added to the
+  matrix.
 - Delegated agent sessions and the native review inspection episode preserve
   the full governance prompt; do not truncate
   BIBLE/ARCHITECTURE/DEVELOPMENT/CHECKLISTS to fit argv or transport limits.

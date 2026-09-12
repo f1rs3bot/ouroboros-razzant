@@ -57,6 +57,7 @@ from ouroboros.config import (
 )
 from ouroboros.deadline_utils import parse_deadline_ts
 from ouroboros.loop_llm_call import TRANSPORT_DEATHS_KEY, _TRANSIENT_BACKOFF_CAP_SEC
+from ouroboros.model_slots import get_limit_fallback_policy, limit_blocks_fallback
 from ouroboros.owner_mailbox import OwnerMailboxPeek
 from ouroboros.utils import append_jsonl, utc_now_iso
 
@@ -171,8 +172,17 @@ def _use_local_fallback_configured() -> bool:
 def fallback_chain_allowed(
     ctx: Any, last_error_kind: str, episode: Optional[TransportWaitEpisode],
     accumulated_usage: Optional[Dict[str, Any]] = None,
+    denial_evidence: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    """Whether this round may walk the cross-model fallback chain."""
+    """Whether this round may walk the cross-model fallback chain.
+
+    The route-limit policy rule is evaluated LAST and REPORTS ITSELF through
+    ``denial_evidence`` (DEVELOPMENT: "whatever decides must be what is
+    reported"): because every pre-existing rule already returned above, an
+    emitted denial means the owner's policy — not an exact route, an unresolved
+    transport death or a live wait episode — is the rule that closed the gate.
+    Callers that pass no evidence (tests, direct probes) get the plain decision.
+    """
     if bool(getattr(ctx, "exact_model_route", False)):
         return False
     if isinstance((accumulated_usage or {}).get(TRANSPORT_DEATHS_KEY), dict):
@@ -192,9 +202,56 @@ def fallback_chain_allowed(
             return False
         episode.local_pass_used = True
         return True
+    if limit_blocks_fallback(last_error_kind):
+        if denial_evidence is not None:
+            emit_limit_fallback_denied(**denial_evidence)
+        return False
     return last_error_kind not in (
         "context_overflow", "provider_outcome_unknown", "deadline_exhausted",
     )
+
+
+def limit_denial_evidence(
+    drive_logs: pathlib.Path, task_id: str, model: str, error_kind: str,
+    round_idx: int = 0,
+) -> Dict[str, Any]:
+    """Evidence bundle for the gate's own route-limit denial disclosure.
+
+    Built at the call site only on a round that actually asked (the caller
+    short-circuits before evaluating it when a message arrived), so a normal
+    round pays nothing. Positional by design: the call site sits inside the
+    size-ratchet-capped ``run_llm_loop``, which must not grow.
+    """
+    return {
+        "drive_logs": drive_logs, "task_id": task_id, "model": model,
+        "error_kind": error_kind, "round_idx": round_idx,
+    }
+
+
+def emit_limit_fallback_denied(
+    drive_logs: pathlib.Path, *, task_id: str, model: str, error_kind: str,
+    round_idx: int = 0,
+) -> None:
+    """Disclose that the owner's policy — not a pre-existing rule — denied the chain.
+
+    BIBLE P1/P3: a setting that suppresses a spend decision is never silent. The
+    row lands in the runtime ``events.jsonl``, which ``append_jsonl`` already
+    streams to the live log sink, so this adds no second delivery path. On a
+    default install this branch is unreachable, so the event's absence there is
+    itself the evidence that the shipped decision is unchanged. Best-effort: a
+    failed append must never change the round's decision.
+    """
+    event = {
+        "ts": utc_now_iso(), "type": "route_limit_policy_denied", "task_id": task_id,
+        "model": model, "error_kind": error_kind, "round": round_idx,
+        "policy": get_limit_fallback_policy(),
+        "detail": ("no cross-model substitution on a route limit: no other route was "
+                   "dialled for this round, and the round ends on its own typed reason"),
+    }
+    try:
+        append_jsonl(pathlib.Path(drive_logs) / "events.jsonl", event)
+    except Exception:
+        log.debug("Failed to append route_limit_policy_denied event", exc_info=True)
 
 
 def reconcile_transport_wait(
