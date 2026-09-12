@@ -576,7 +576,7 @@ def test_generic_restart_ignores_stale_evolution_marker(tmp_path, monkeypatch):
 
 def test_supervisor_blocks_restart_when_head_moved_after_receipt(tmp_path):
     import server
-    from supervisor import evolution_lifecycle
+    from supervisor import evolution_lifecycle, git_ops
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -586,6 +586,9 @@ def test_supervisor_blocks_restart_when_head_moved_after_receipt(tmp_path):
     (repo / "file.txt").write_text("current\n")
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-m", "current"], cwd=repo, check=True, capture_output=True)
+    # The claim verdict reads HEAD and the worktree facts through the git-ops
+    # module (one repo root, the same one the reset machinery moves).
+    git_ops.init(repo, tmp_path, "")
     campaign, tx = _active_transaction(tmp_path)
     reviewed_sha = "2" * 40
     claim = {

@@ -1390,14 +1390,21 @@ def test_module_grandfather_matcher_uses_exact_repo_relative_paths():
     # a DIFFERENT plugin.py (future skill) is NOT exempted by the path-qualified entry
     assert not module_is_grandfathered("skills/other_skill/plugin.py")
     assert not module_is_grandfathered("repo/skills/other_skill/plugin.py")
-    # Root server.py is an exact manifest path; a nested same-basename is not.
-    assert module_is_grandfathered("server.py")
+    # The positive+negative exact-path pair: an exact repo-relative manifest
+    # entry is grandfathered, a prefixed or nested lookalike is not. Root
+    # `server.py` carried this case until its debt was paid down below the
+    # 1600-line cap and its entry left GIANT_PATHS (1628 -> 1593 lines).
+    assert module_is_grandfathered("ouroboros/tools/git.py")
+    assert not module_is_grandfathered("repo/ouroboros/tools/git.py")
+    assert not module_is_grandfathered("git.py")
+    assert not module_is_grandfathered("tools/git.py")
+    assert not module_is_grandfathered("server.py")
     assert not module_is_grandfathered("repo/server.py")
     assert not module_is_grandfathered("ouroboros/server.py")
     assert not module_is_grandfathered("repo/ouroboros/server.py")
     # tools/control.py's debt was retired by the v7 split (2110->492 lines);
     # basename exactness still holds - NEITHER control.py is grandfathered now
-    # (the positive+negative exact-path pair above is server.py).
+    # (the positive+negative exact-path pair above is ouroboros/tools/git.py).
     assert not module_is_grandfathered("ouroboros/tools/control.py")
     assert not module_is_grandfathered("ouroboros/gateway/control.py")
 

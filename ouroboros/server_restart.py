@@ -4,7 +4,8 @@ The live-task census the restart drain consults, the teardown arguments that
 finalize interrupted tasks with an honest reason, the managed-update guard on
 preserving queued work, the checkout/update serialization gate, the owned-work
 stop of the owner's manual Restart, the planned restart's engine-pin daemon stop,
-and the event bus shutdown. The restart
+the evolution-restart claim verdict with its durable refusal record, and the
+event bus shutdown. The restart
 transaction itself — the deferred drain record and the performer that raises
 the exit signal — stays in ``server.py`` for now: the upstream delegation
 train coupled it to the composition root through the planned-handoff
@@ -15,7 +16,7 @@ from __future__ import annotations
 
 import pathlib
 import time
-from typing import Any
+from typing import Any, Dict, Optional
 
 from ouroboros.server_process import DATA_DIR, _owner_restart_requested, _restart_requested, log
 
@@ -231,6 +232,170 @@ def _safe_restart_serialized(safe_restart_fn, *, reason: str, unsynced_policy: s
         return safe_restart_fn(reason=reason, unsynced_policy=unsynced_policy)
     finally:
         release_update_lock(lock_fh)
+
+
+# Closed reason set for a refusal of the evolution absorption boundary's claim
+# verdict. Every one is fail-closed: the reviewed commit is not proven live, so
+# the restart must not proceed.
+EVOLUTION_RESTART_REFUSAL_REASONS = (
+    "receipt_missing",
+    "authority_changed",
+    "head_mismatch",
+    "repo_state_unreadable",
+    "unsynced_tree",
+)
+# The downstream checkout/update gate's own refusal, recorded under the same row
+# type so a deferred absorption is never chat-only whichever surface refused it.
+RESTART_GATE_REFUSAL_REASON = "checkout_gate_refused"
+
+
+def record_restart_refusal(
+    drive_root: Any,
+    *,
+    source: str,
+    reason: str,
+    detail: str = "",
+    evolution_restart: bool = True,
+    facts: Optional[Dict[str, Any]] = None,
+) -> None:
+    """One durable row per refused restart of the evolution absorption boundary.
+
+    Guarded by ``evolution_restart``: an ordinary restart refusal records
+    nothing, so this row type stays the evolution boundary's own record. Never
+    raises — a refusal that cannot be recorded must still refuse.
+    """
+    if not evolution_restart:
+        return
+    try:
+        from ouroboros.utils import append_jsonl, utc_now_iso
+
+        facts = facts or {}
+        append_jsonl(
+            pathlib.Path(drive_root) / "logs" / "supervisor.jsonl",
+            {
+                "ts": utc_now_iso(),
+                "type": "evolution_restart_refused",
+                "source": source,
+                "reason": reason,
+                "detail": str(detail or ""),
+                "restart_reason": str(facts.get("restart_reason") or ""),
+                "expected_sha": str(facts.get("expected_sha") or ""),
+                "observed_head": str(facts.get("observed_head") or ""),
+                "dirty_count": int(facts.get("dirty_count") or 0),
+                "dirty_preview": list(facts.get("dirty_preview") or []),
+                "unpushed_count": int(facts.get("unpushed_count") or 0),
+                "warnings": list(facts.get("warnings") or []),
+            },
+        )
+    except Exception:
+        log.warning("Failed to record an evolution-restart refusal", exc_info=True)
+
+
+def _unsynced_bits(state: Dict[str, Any]) -> str:
+    """Detail vocabulary for a proven-unsynced worktree.
+
+    A DECLARED STRICT SUBSET of the reset admission gate's classifier: a merge
+    in progress or an unreadable MERGE_HEAD is deliberately not re-derived here.
+    The gate owns that classification downstream (its module is a protected
+    release invariant this path may not edit) and ITS refusal is recorded too,
+    so no refusal escapes the audit and no second spelling of "unsynced" is
+    introduced.
+    """
+    bits = []
+    if state.get("dirty_lines"):
+        bits.append(f"dirty={len(state.get('dirty_lines') or [])}")
+    if any(str(w).startswith("status_error:") for w in (state.get("warnings") or [])):
+        bits.append("status_unreadable")
+    return ", ".join(bits) or "unsynced"
+
+
+def assess_evolution_restart_claim(
+    *, drive_root: Any, claim: Any, restart_reason: str = "",
+) -> Dict[str, Any]:
+    """The one owner of the evolution-restart claim verdict.
+
+    Consulted whenever a restart carries ``evolution_restart`` — INCLUDING when
+    the claim is absent, which is itself a refusal: a restart whose exact receipt
+    vanished during the drain must never proceed. Returns ``{"ok", "reason",
+    "message"}`` plus the observed facts, and records exactly one durable
+    ``evolution_restart_refused`` row (``source="claim"``) per refusal.
+
+    HEAD and the worktree facts are both read through ``supervisor.git_ops``,
+    i.e. against the same configured repo root the checkout/reset machinery
+    moves, so the tree this verdict classifies IS the tree the restart would act
+    on. A dirty worktree is refused rather than reset: resetting would discard
+    another actor's uncommitted work, and the owner's own Restart is the
+    consented path that rescues and resets it.
+    """
+    claim = claim if isinstance(claim, dict) else {}
+    expected_sha = str(claim.get("commit_sha") or "")
+    facts: Dict[str, Any] = {
+        "expected_sha": expected_sha,
+        "restart_reason": str(restart_reason or ""),
+    }
+
+    def _refuse(reason: str, message: str) -> Dict[str, Any]:
+        record_restart_refusal(
+            drive_root, source="claim", reason=reason, detail=message, facts=facts,
+        )
+        return {"ok": False, "reason": reason, "message": message, **facts}
+
+    if not claim:
+        return _refuse(
+            "receipt_missing",
+            "🧬 Restart cancelled: the exact evolution restart receipt is missing.",
+        )
+    from supervisor.evolution_lifecycle import check_evolution_authority
+
+    authority = check_evolution_authority(
+        str(claim.get("campaign_id") or ""),
+        str(claim.get("transaction_id") or ""),
+        str(claim.get("task_id") or ""),
+        commit_sha=expected_sha,
+    )
+    if not authority.get("ok"):
+        return _refuse(
+            "authority_changed",
+            "🧬 Restart cancelled: evolution authority changed "
+            f"({authority.get('reason') or 'unknown'}).",
+        )
+    from supervisor import git_ops
+
+    unsynced = git_ops._collect_repo_sync_state()
+    facts.update({
+        "dirty_count": len(unsynced.get("dirty_lines") or []),
+        "dirty_preview": list(unsynced.get("dirty_lines") or [])[:20],
+        "unpushed_count": len(unsynced.get("unpushed_lines") or []),
+        "warnings": list(unsynced.get("warnings") or []),
+    })
+    if any(str(w).startswith("status_error:") for w in facts["warnings"]):
+        return _refuse(
+            "repo_state_unreadable",
+            "🧬 Restart cancelled: the repository state could not be read, so the "
+            "reviewed checkout could not be proven.",
+        )
+    rc, head_out, _head_err = git_ops.rescue_git_capture(["git", "rev-parse", "HEAD"])
+    observed = str(head_out or "").strip() if rc == 0 else ""
+    facts["observed_head"] = observed
+    if not expected_sha or rc != 0 or observed != expected_sha:
+        return _refuse(
+            "head_mismatch",
+            "🧬 Restart cancelled: the live checkout no longer matches the exact "
+            f"reviewed evolution commit (HEAD {observed or 'unreadable'} != "
+            f"{expected_sha or 'missing'}).",
+        )
+    if facts["dirty_count"]:
+        preview = "; ".join(str(row) for row in facts["dirty_preview"])
+        return _refuse(
+            "unsynced_tree",
+            "🧬 Restart cancelled: the worktree is unsynced "
+            f"({_unsynced_bits(unsynced)}) and an agent-initiated restart does not "
+            "reset another actor's uncommitted work"
+            + (f": {preview}" if preview else "")
+            + ". Press Restart to rescue and reset the tree (that path absorbs), "
+            "or wait for the unsynced work to land and retry.",
+        )
+    return {"ok": True, "reason": "", "message": "", **facts}
 
 
 def _shutdown_task_cleanup_args(restart_requested: bool) -> tuple[str, str]:

@@ -4,7 +4,6 @@ import asyncio
 import base64  # noqa: F401
 import json
 import logging
-import subprocess
 
 import os
 import pathlib
@@ -94,6 +93,7 @@ from ouroboros.server_maintenance import (  # noqa: F401
     _startup_worktree_prune,
 )
 from ouroboros.server_restart import (  # noqa: F401
+    RESTART_GATE_REFUSAL_REASON,
     _live_running_task_ids,
     _managed_update_pending_kwargs,
     _safe_restart_serialized,
@@ -101,6 +101,8 @@ from ouroboros.server_restart import (  # noqa: F401
     _shutdown_task_cleanup_args,
     _stop_owned_daemon_for_new_pin,
     _stop_owned_work,
+    assess_evolution_restart_claim,
+    record_restart_refusal,
 )
 
 REPO_DIR = pathlib.Path(os.environ.get("OUROBOROS_REPO_DIR", pathlib.Path(__file__).parent))
@@ -921,59 +923,17 @@ def _perform_supervisor_restart(
         if evolution_restart and marker.get("reason") == restart_reason
         else {}
     )
-    claim = claim if isinstance(claim, dict) else {}
-    if evolution_restart and not claim:
-        if st.get("owner_chat_id"):
-            ctx.send_with_budget(
-                int(st["owner_chat_id"]),
-                "🧬 Restart cancelled: the exact evolution restart receipt is missing.",
-            )
-        return
-    if claim:
-        from supervisor.evolution_lifecycle import check_evolution_authority
-
-        authority = check_evolution_authority(
-            str(claim.get("campaign_id") or ""),
-            str(claim.get("transaction_id") or ""),
-            str(claim.get("task_id") or ""),
-            commit_sha=str(claim.get("commit_sha") or ""),
+    if evolution_restart:
+        # One owner for the whole claim verdict — the receipt, the authority, the
+        # reviewed HEAD and the unsynced worktree. Called WITH a possibly-empty
+        # claim on purpose: a receipt that vanished during the drain is itself a
+        # refusal. Every refusal is recorded durably by the verdict.
+        verdict = assess_evolution_restart_claim(
+            drive_root=ctx.DRIVE_ROOT, claim=claim, restart_reason=restart_reason,
         )
-        if not authority.get("ok"):
+        if not verdict.get("ok"):
             if st.get("owner_chat_id"):
-                ctx.send_with_budget(
-                    int(st["owner_chat_id"]),
-                    "🧬 Restart cancelled: evolution authority changed "
-                    f"({authority.get('reason') or 'unknown'}).",
-                )
-            return
-        expected_sha = str(claim.get("commit_sha") or "")
-        try:
-            head_proc = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=str(ctx.REPO_DIR),
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            status_proc = subprocess.run(
-                ["git", "status", "--porcelain"],
-                cwd=str(ctx.REPO_DIR),
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            head = head_proc.stdout.strip() if head_proc.returncode == 0 else ""
-            clean = status_proc.returncode == 0 and not status_proc.stdout.strip()
-        except Exception:
-            head = ""
-            clean = False
-        if not expected_sha or head != expected_sha or not clean:
-            if st.get("owner_chat_id"):
-                ctx.send_with_budget(
-                    int(st["owner_chat_id"]),
-                    "🧬 Restart cancelled: the live checkout no longer matches "
-                    "the exact reviewed evolution commit.",
-                )
+                ctx.send_with_budget(int(st["owner_chat_id"]), verdict["message"])
             return
     ok, msg = _safe_restart_serialized(
         ctx.safe_restart,
@@ -981,6 +941,11 @@ def _perform_supervisor_restart(
         unsynced_policy="rescue_and_block",
     )
     if not ok:
+        record_restart_refusal(
+            ctx.DRIVE_ROOT, source="downstream",
+            reason=RESTART_GATE_REFUSAL_REASON, detail=str(msg or ""),
+            evolution_restart=bool(evolution_restart),
+        )
         try:
             from supervisor.evolution_lifecycle import pause_evolution_campaign
 
