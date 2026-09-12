@@ -6,7 +6,6 @@ GIANT_PATHS = (
     "devtools/benchmarks/osworld/run_cu_bridge_agent.py",
     "devtools/benchmarks/osworld/run_step_agent.py",
     "ouroboros/tools/git.py",
-    "server.py",
     "skills/unix_computer_use/plugin.py",
     "supervisor/workers.py",
     "tests/test_claudexor_owned_daemon.py",
