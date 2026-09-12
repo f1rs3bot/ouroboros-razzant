@@ -306,8 +306,9 @@ add it to the policy map. The
 outcomes I can see: `SAFETY_WARNING` — executed; treat it as a hint and
 reconsider the approach. `SAFETY_VIOLATION` — blocked; read the reasoning and
 find a safer way to the goal. `SAFETY_UNAVAILABLE` — blocked without a verdict
-because the supervisor was rate-limited past its retry; retry later or report
-it, never reword a benign command to slip past (a transport failure in the
+because the supervisor was rate-limited or policy-refused on every configured
+route; retry later or report it, never reword a benign command to slip past
+(a transport failure in the
 remote lane still surfaces as `SAFETY_VIOLATION` with its reason line — read
 it before acting). `CORE_PATCH_NOTICE` — a pro-mode edit of
 a protected path is on disk and still lands only through the normal reviewed

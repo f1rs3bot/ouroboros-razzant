@@ -41,6 +41,11 @@ CONTEXT_OVERFLOW_CODES = frozenset({
     "model_context_window_exceeded",
     "prompt_too_long",
     "input_too_long",
+    # OpenAI-validated proxies (e.g. codex-lb) reject an oversized `instructions`
+    # string with `string_above_max_length` + param=instructions: the field that
+    # would not fit IS the prompt, so the overflow ladder (compact + retry
+    # smaller) is the right rail, not a bad-request terminal.
+    "string_above_max_length",
 })
 CONTEXT_OVERFLOW_MESSAGE_MARKERS = (
     "context_length_exceeded",

@@ -786,23 +786,13 @@ def _is_throughput_rate_limit(kind: str, status_code: Optional[int], safe_error:
     return status_code == 429 or (status_code is None and is_rate_limit_text(safe_error))
 
 
-def _safety_rate_limit_reason(
-    exc: Optional[Exception], usage: Optional[Dict[str, Any]], safe_error: str,
-) -> Optional[str]:
-    """Sanitized bounded description when THIS attempt was rate-limited, else None."""
-    if exc is not None:
-        found = classify_llm_exception(exc, safe_error)
-        if not _is_throughput_rate_limit(found.kind, found.status_code, safe_error):
-            return None
-        return f"{found.kind}: {safe_error}"[:300]
-    body = usage.get("provider_error") if isinstance(usage, dict) else None
-    if isinstance(body, dict) and _body_is_quota_refusal(body):
-        return None  # structured insufficient-quota is PERMANENT: keep today's blocking path
-    if not isinstance(body, dict) or str(body.get("kind") or "") != _SAFETY_BODY_RATE_LIMIT_KIND:
-        return None
-    return sanitize_tool_result_for_log(
-        f"{body.get('kind')} (code={body.get('code')}): {body.get('message')}"
-    )[:300]
+def _rate_limit_rotation_denied() -> bool:
+    """The owner's one-directional spend gate (OUROBOROS_ROUTE_LIMIT_FALLBACK=deny):
+    a route LIMIT — the rate_limit class included — may not be answered by dialing
+    another, possibly metered, route. It can only deny a rotation, never enable one;
+    a policy_refusal is not a limit kind and stays unaffected."""
+    from ouroboros.model_slots import ROUTE_LIMIT_FALLBACK_DENY, get_limit_fallback_policy
+    return get_limit_fallback_policy() == ROUTE_LIMIT_FALLBACK_DENY
 
 
 def _safety_rate_limit_backoff(ctx: Optional[Any]) -> None:
@@ -840,6 +830,36 @@ def _rate_limited_outcome(
             f"and could not check this call ({error}). {_UNCHECKED_WARNING_SUFFIX}"
         )
     return _safety_unavailable_blocked(ctx, tool_name, error, arm_latch=arm_latch, attempts=attempts)
+
+
+def _policy_refused_outcome(
+    ctx: Optional[Any], tool_name: str, error: str,
+) -> Tuple[bool, str]:
+    """Every candidate route refused the SAFETY PROMPT itself on content grounds.
+
+    Same honest shape as the rate-limit outcome: an infrastructure fact about
+    the supervisor, never a verdict about the tool call — the guarded call is
+    blocked UNCHECKED with a retry contract, the ⚠️ *_UNAVAILABLE prefix keeps
+    it out of `safety_violation` downstream, and the durable event names the
+    recovery: pick a safety-capable route in OUROBOROS_MODEL_LIGHT /
+    OUROBOROS_MODEL_FALLBACKS that accepts security-review prompts.
+    """
+    log.error(
+        "Safety check policy-refused on every candidate for %s; blocking unchecked: %s",
+        tool_name, error,
+    )
+    _emit_durable_safety_event(ctx, {
+        "type": "safety_check_policy_refused", "tool": tool_name,
+        "action": "blocked_unchecked_policy_refused", "error": error,
+    })
+    return False, (
+        "⚠️ SAFETY_UNAVAILABLE: The Safety Supervisor's configured routes refused "
+        "the safety prompt itself on content-policy grounds "
+        f"({error}). This is an infrastructure fact about the supervisor, NOT a verdict "
+        "about your call. Retry the same call, or ask the owner to point "
+        "OUROBOROS_MODEL_LIGHT / OUROBOROS_MODEL_FALLBACKS at a route that accepts "
+        "security-review prompts."
+    )
 
 
 def _safety_unavailable_blocked(
@@ -957,20 +977,97 @@ def _subject_too_large_blocked(
     )
 
 
+class _SafetyPolicyRefused(Exception):
+    """Terminal: every candidate route REFUSED the safety prompt on content
+    grounds (a `cyber_policy`-class code). Not a verdict about the tool call —
+    an infrastructure incompatibility between the safety prompt (which quotes
+    the proposed call verbatim, so authorized security work carries exploit
+    strings) and the configured routes' content filters."""
+
+
+def _safety_rotation_reason(
+    exc: Optional[Exception], usage: Optional[Dict[str, Any]], safe_error: str,
+) -> Optional[Tuple[str, str]]:
+    """(rotation_class, reason) when this attempt qualifies for the fallback
+    walk, else None. Two classes rotate:
+
+    - ``rate_limit``: a genuine throughput 429 (the pre-existing rule).
+    - ``policy_refusal``: a structured content-policy code (``cyber_policy`` &c.)
+      surfaced by ``classify_llm_exception``. Permanent for THIS request on THIS
+      route — a same-model retry pays for the identical refusal, so it rotates
+      WITHOUT a second attempt on the same candidate.
+
+    Quota/auth/permanent classes never rotate (their first exception re-raises
+    with today's exact semantics); a structured insufficient-quota body keeps
+    its blocking precedence over a 429 exactly as before.
+    """
+    if exc is not None:
+        found = classify_llm_exception(exc, safe_error)
+        if found.kind == "provider_policy_refusal":
+            return "policy_refusal", f"provider_policy_refusal: {safe_error}"[:300]
+        if _is_throughput_rate_limit(found.kind, found.status_code, safe_error):
+            return "rate_limit", f"{found.kind}: {safe_error}"[:300]
+        return None
+    body = usage.get("provider_error") if isinstance(usage, dict) else None
+    if isinstance(body, dict) and _body_is_quota_refusal(body):
+        return None  # structured insufficient-quota is PERMANENT: keep today's blocking path
+    if isinstance(body, dict):
+        # The HTTP-200 sibling of the raised shape: the same structured
+        # policy code in the BODY rotates too — otherwise an unparseable
+        # "successful" error body would end as a false unparseable verdict.
+        from ouroboros.loop_llm_call import _PROVIDER_POLICY_REFUSAL_CODES
+        body_values = {
+            str(body.get(key) or "").strip().lower() for key in ("code", "type")
+        }
+        if body_values & _PROVIDER_POLICY_REFUSAL_CODES:
+            return "policy_refusal", sanitize_tool_result_for_log(
+                f"provider_policy_refusal (code={body.get('code')}): {body.get('message')}"
+            )[:300]
+    if not isinstance(body, dict) or str(body.get("kind") or "") != _SAFETY_BODY_RATE_LIMIT_KIND:
+        return None
+    return "rate_limit", sanitize_tool_result_for_log(
+        f"{body.get('kind')} (code={body.get('code')}): {body.get('message')}"
+    )[:300]
+
+
+def _safety_fallback_candidates(light_model: str, use_local: bool) -> List[str]:
+    """Owner-configured cross-model chain for the safety lane, minus the active
+    model. A LOCAL light route keeps its own lane (the chain is remote); the
+    chain is exactly ``OUROBOROS_MODEL_FALLBACKS`` — the same setting the main
+    loop reads, so "the more lenient model I picked in settings" applies here
+    without a second knob."""
+    if use_local:
+        return []
+    from ouroboros.model_slots import get_fallback_models
+    return get_fallback_models(light_model)
+
+
 def _safety_model_call(
     *, client: Any, ctx: Optional[Any], tool_name: str, light_model: str,
     use_local: bool, call_type: str, user_prompt: str, on_usage: Any,
 ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
-    """ONE safety model call, with ONE bounded retry when the provider rate-limits it.
+    """ONE safety model call over a bounded candidate walk.
 
-    Both wire shapes reach here: a RAISED provider error, and an HTTP-200 whose body
-    carried it (`usage["provider_error"]`) — the production shape, which never raises,
-    so an exception-only check would miss it. A non-rate-limit exception is re-raised
-    unchanged so every existing lane stays byte-identical; two rate-limited attempts
-    raise `_SafetyRateLimited`. A rate-limited attempt's usage is still accounted: the
-    call was physical. The v6.40 per-model self-DoS slot is taken PER ATTEMPT (this is
-    the highest-frequency LIGHT consumer — every tool call on every in-process subagent
-    thread) with the backoff outside it.
+    Candidates are ``[light_model] + OUROBOROS_MODEL_FALLBACKS`` (remote light
+    route only; the local lane keeps its own contract). Two failure classes
+    rotate to the next candidate: a genuine throughput 429 (with the
+    pre-existing ONE bounded retry per candidate) and a structured
+    content-policy refusal (no same-model retry — the refusal is permanent for
+    this request). Everything else re-raises unchanged on the FIRST candidate
+    so every existing lane stays byte-identical; on a FALLBACK candidate an
+    infrastructure error is one more fact in the walk, never a fresh
+    SAFETY_VIOLATION of its own. The walk is deadline-gated as a whole.
+
+    Terminal shapes: rate-limit exhaustion raises `_SafetyRateLimited`
+    (existing outcomes preserved); policy-refusal exhaustion raises
+    `_SafetyPolicyRefused`. Every attempt's usage is accounted on the ROUTE
+    THAT SERVED IT (`resolved_model` rebound per candidate — a rotated call
+    must not be priced on the light route). Each rotation is disclosed in the
+    durable `safety_fallback_rotation` event.
+
+    Both wire shapes reach here: a RAISED provider error, and an HTTP-200 whose
+    body carried it (`usage["provider_error"]`). The v6.40 per-model self-DoS
+    slot is taken PER ATTEMPT with the backoff outside it.
     """
     from ouroboros import model_concurrency
     from ouroboros.llm_observability import chat_observed
@@ -981,69 +1078,130 @@ def _safety_model_call(
             "safety lane cooling down after a recent rate-limit storm; no attempt made",
             latched=True,
         )
+    candidates = [light_model] + _safety_fallback_candidates(light_model, use_local)
     reason = ""
-    for attempt in range(2):
-        if attempt:
-            deadline = _safety_deadline_epoch(ctx)
-            if deadline is not None and time.time() >= deadline:
-                break  # the task deadline is spent: the retry would be a paid call past it
-            _safety_rate_limit_backoff(ctx)
-            if deadline is not None and time.time() >= deadline:
-                break  # the backoff sleep itself consumed the deadline
-        exc: Optional[Exception] = None
-        msg: Dict[str, Any] = {}
-        usage: Optional[Dict[str, Any]] = None
-        try:
-            with model_concurrency.model_call_slot(
-                light_model, use_local, _safety_deadline_epoch(ctx)
-            ):
-                msg, usage = chat_observed(
-                    client,
-                    drive_root=_safety_drive_root(ctx),
-                    task_id=str(getattr(ctx, "task_id", "") or "safety"),
-                    call_type=call_type,
-                    # This payload is TOOL-FREE and the send-time cache finalizer may only
-                    # mark a tool schema, so the lane is cacheable only because the CALLER
-                    # declares its own stable prefix, as every review surface does: the
-                    # byte-stable SAFETY.md prompt is the whole prefix (the repair call
-                    # reuses it and reads the cache the first attempt wrote) and the tool
-                    # proposal stays in the unmarked user turn. Transport shape only — text,
-                    # model slot, parsing and fail-closed semantics unchanged; a route that
-                    # cannot carry markers has them stripped back to the identical single
-                    # block. Disclosed residual: on OpenAI-compatible lanes the system
-                    # content goes over the wire as a ONE-ELEMENT block list, so a strict
-                    # self-hosted LIGHT endpoint rejecting array content surfaces as
-                    # SAFETY_VIOLATION (this lane fails CLOSED there), never as a bypass.
-                    messages=[
-                        {"role": "system", "content": cached_prompt_blocks(
-                            _get_safety_prompt(), ttl=_SAFETY_CACHE_TTL)},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    model=light_model, use_local=use_local,
-                    max_tokens=get_safety_max_tokens(), reasoning_effort="low",
-                    timeout=get_safety_call_timeout_sec(),
-                    model_role="light",
-                    response_format=({"type": "json_object"}
-                                     if LLMClient.supports_response_format(light_model, use_local=use_local)
-                                     else None),
+    rotation_class = ""
+    total_attempts = 0  # physical rate-limited attempts ACROSS candidates: the storm latch's fact
+    last_exc: Optional[Exception] = None  # a fallback candidate's own infra error, if that is how the walk ended
+    for candidate_index, candidate_model in enumerate(candidates):
+        candidate_local = use_local and candidate_index == 0
+        if candidate_index:
+            _emit_durable_safety_event(ctx, {
+                "type": "safety_fallback_rotation",
+                "tool": tool_name,
+                "from_model": candidates[candidate_index - 1],
+                "to_model": candidate_model,
+                "rotation_class": rotation_class,
+            })
+        def _candidate_usage(usage_payload: Optional[Dict[str, Any]],
+                             _model: str = candidate_model) -> None:
+            if isinstance(usage_payload, dict) and not usage_payload.get("resolved_model"):
+                usage_payload["resolved_model"] = _model
+            on_usage(usage_payload)
+
+        for attempt in range(2):
+            if attempt:
+                deadline = _safety_deadline_epoch(ctx)
+                if deadline is not None and time.time() >= deadline:
+                    break  # the task deadline is spent: the retry would be a paid call past it
+                _safety_rate_limit_backoff(ctx)
+                if deadline is not None and time.time() >= deadline:
+                    break  # the backoff sleep itself consumed the deadline
+            exc: Optional[Exception] = None
+            msg: Dict[str, Any] = {}
+            usage: Optional[Dict[str, Any]] = None
+            try:
+                with model_concurrency.model_call_slot(
+                    candidate_model, candidate_local, _safety_deadline_epoch(ctx)
+                ):
+                    msg, usage = chat_observed(
+                        client,
+                        drive_root=_safety_drive_root(ctx),
+                        task_id=str(getattr(ctx, "task_id", "") or "safety"),
+                        call_type=call_type,
+                        # This payload is TOOL-FREE and the send-time cache finalizer may only
+                        # mark a tool schema, so the lane is cacheable only because the CALLER
+                        # declares its own stable prefix, as every review surface does: the
+                        # byte-stable SAFETY.md prompt is the whole prefix (the repair call
+                        # reuses it and reads the cache the first attempt wrote) and the tool
+                        # proposal stays in the unmarked user turn. Transport shape only — text,
+                        # model slot, parsing and fail-closed semantics unchanged; a route that
+                        # cannot carry markers has them stripped back to the identical single
+                        # block. Disclosed residual: on OpenAI-compatible lanes the system
+                        # content goes over the wire as a ONE-ELEMENT block list, so a strict
+                        # self-hosted LIGHT endpoint rejecting array content surfaces as
+                        # SAFETY_VIOLATION (this lane fails CLOSED there), never as a bypass.
+                        messages=[
+                            {"role": "system", "content": cached_prompt_blocks(
+                                _get_safety_prompt(), ttl=_SAFETY_CACHE_TTL)},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        model=candidate_model, use_local=candidate_local,
+                        max_tokens=get_safety_max_tokens(), reasoning_effort="low",
+                        timeout=get_safety_call_timeout_sec(),
+                        model_role="light",
+                        response_format=({"type": "json_object"}
+                                         if LLMClient.supports_response_format(candidate_model, use_local=candidate_local)
+                                         else None),
+                    )
+            except Exception as e:
+                from ouroboros.llm_claudexor import propagate_model_error
+                propagate_model_error(e)
+                exc = e
+            safe_error = sanitize_tool_result_for_log(f"{type(exc).__name__}: {exc}") if exc else ""
+            rotation = _safety_rotation_reason(exc, usage, safe_error)
+            _candidate_usage(usage)
+            if rotation is None:
+                if exc is not None:
+                    if candidate_index == 0:
+                        raise exc  # first candidate: byte-identical pre-walk semantics
+                    # A fallback candidate's own infrastructure error is one
+                    # more fact in the walk, never a fresh verdict of its own —
+                    # but it IS the real last cause: record it so the terminal
+                    # and the next rotation row never carry a stale class.
+                    last_exc = exc
+                    rotation_class = "infra_error"
+                    reason = safe_error
+                    log.warning(
+                        "Safety fallback candidate %s failed for %s (%s); continuing the walk",
+                        candidate_model, tool_name, safe_error,
+                    )
+                    break
+                return msg, usage
+            rotation_class, reason = rotation
+            last_exc = None  # a real rotation fact supersedes an earlier candidate's infra error
+            if rotation_class == "rate_limit":
+                total_attempts += 1  # the storm latch counts physical 429s, never policy refusals
+            if rotation_class == "policy_refusal":
+                log.warning(
+                    "Safety check policy-refused on %s for %s; rotating without a same-model retry: %s",
+                    candidate_model, tool_name, reason,
                 )
-        except Exception as e:
-            from ouroboros.llm_claudexor import propagate_model_error
-            propagate_model_error(e)
-            exc = e
-        safe_error = sanitize_tool_result_for_log(f"{type(exc).__name__}: {exc}") if exc else ""
-        rate_limited = _safety_rate_limit_reason(exc, usage, safe_error)
-        on_usage(usage)
-        if rate_limited is None:
-            if exc is not None:
-                raise exc
-            return msg, usage
-        reason = rate_limited
-        attempts = attempt + 1
-        log.warning(
-            "Safety check rate-limited for %s (attempt %d/2): %s", tool_name, attempts, reason,
-        )
-    raise _SafetyRateLimited(reason, attempts=attempts)
+                break  # permanent for THIS request on THIS route: next candidate
+            log.warning(
+                "Safety check rate-limited for %s on %s (attempt %d/2): %s",
+                tool_name, candidate_model, attempt + 1, reason,
+            )
+        # Both attempts (or the one permanent refusal) on this candidate are spent.
+        if rotation_class == "rate_limit" and _rate_limit_rotation_denied():
+            # The owner's one-directional deny: a LIMIT is never answered by a
+            # metered substitution. The terminal below keeps the pre-walk
+            # single-route shape; the denial itself is disclosed, never silent.
+            _emit_durable_safety_event(ctx, {
+                "type": "route_limit_policy_denied",
+                "tool": tool_name,
+                "model": candidate_model,
+                "rotation_class": rotation_class,
+            })
+            break
+        deadline = _safety_deadline_epoch(ctx)
+        if deadline is not None and time.time() >= deadline:
+            break  # the whole walk is deadline-gated, not per-candidate
+    if last_exc is not None:
+        raise last_exc  # the walk ended on a route's own failure: its real error, its real class
+    if rotation_class == "policy_refusal":
+        raise _SafetyPolicyRefused(reason)
+    raise _SafetyRateLimited(reason, attempts=max(1, total_attempts))
 
 
 def _run_llm_check(
@@ -1078,7 +1236,7 @@ def _run_llm_check(
             provider = "local"
             model_name = f"{light_model} (local)"
         else:
-            provider = str(usage_payload.get("provider") or infer_provider_from_model(light_model))
+            provider = str(usage_payload.get("provider") or infer_provider_from_model(resolved_model))
             model_name = resolved_model
         raw_cost = usage_payload.get("cost")
         cost = None
@@ -1133,6 +1291,8 @@ def _run_llm_check(
             arm_latch=not getattr(e, "latched", False),
             attempts=getattr(e, "attempts", 2),
         )
+    except _SafetyPolicyRefused as e:
+        return _policy_refused_outcome(ctx, tool_name, str(e))
     except Exception as e:
         from ouroboros.llm_claudexor import propagate_model_error
         propagate_model_error(e)
@@ -1186,6 +1346,8 @@ def _run_llm_check(
                 arm_latch=not getattr(e, "latched", False),
                 attempts=getattr(e, "attempts", 2),
             )
+        except _SafetyPolicyRefused as e:
+            return _policy_refused_outcome(ctx, tool_name, str(e))
         except Exception as exc:
             from ouroboros.llm_claudexor import propagate_model_error
             propagate_model_error(exc)

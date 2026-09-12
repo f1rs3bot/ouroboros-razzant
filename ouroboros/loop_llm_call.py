@@ -554,6 +554,11 @@ _RATE_LIMIT_TEXT_MARKERS = (
 )
 _RETRYABLE_PROVIDER_CODES = frozenset({"rate_limit_exceeded"})
 
+# Structured CONTENT-policy codes from the provider's error body (e.g. a 502 whose
+# body carries `code: "cyber_policy"`): permanent for this exact request, so the
+# owner's cross-model chain answers it. Narrow: "invalid_request" stays bad_request.
+_PROVIDER_POLICY_REFUSAL_CODES = frozenset({"cyber_policy", "content_policy_violation", "moderation_blocked", "content_filter", "guardrails", "safety_refusal"})
+
 
 def _is_rate_limit_text(text: str) -> bool:
     low = str(text or "").lower()
@@ -739,6 +744,11 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
     # Typed refusal (llm_attempt.ProviderPolicyRefusal): nothing upstream answered,
     # permanent by class — structural, and it outranks every prose heuristic below.
     if _is_provider_policy_refusal(exc):
+        return LlmErrorClassification(PROVIDER_POLICY_REFUSAL, False, status_code, provider_code or PROVIDER_POLICY_REFUSAL)
+    # Structured content-policy code anywhere in the exception's own facts
+    # (attrs/body/capture): outranks the status rails — a 502 carrying
+    # `cyber_policy` is not a transient outage worth re-dialing.
+    if {str(v or "").strip().lower() for v in _exception_provider_values(exc)} & _PROVIDER_POLICY_REFUSAL_CODES:
         return LlmErrorClassification(PROVIDER_POLICY_REFUSAL, False, status_code, provider_code or PROVIDER_POLICY_REFUSAL)
     provider_message = _exception_provider_message(exc, safe)
     classification_text = "\n".join(v for v in (safe, provider_message) if str(v or "").strip())
