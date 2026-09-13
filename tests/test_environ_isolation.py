@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 
+from tests import conftest
 from tests.conftest import restored_os_environ
 
 
@@ -51,3 +52,11 @@ def test_the_snapshot_is_registered_autouse_for_every_test(request):
     """Pins the WIRING (autouse=True on the conftest fixture), not the helper
     body: without it the generator above is correct and never runs."""
     assert "_os_environ_isolation" in request.fixturenames
+
+
+def test_inherited_review_cycle_cap_is_scrubbed(monkeypatch):
+    """Focused tests must use the shipped cap, not the operator's setting."""
+    key = "OUROBOROS_REVIEW_MAX_CYCLES"
+    os.environ[key] = "3"
+    conftest._scrub_inherited_subagent_selection.__wrapped__(monkeypatch)
+    assert key not in os.environ

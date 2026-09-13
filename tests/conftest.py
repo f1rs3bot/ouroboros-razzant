@@ -430,6 +430,7 @@ def _scrub_inherited_subagent_selection(monkeypatch):
     monkeypatch.delenv("OUROBOROS_SUBAGENT_PROFILE", raising=False)
     monkeypatch.delenv("OUROBOROS_SUBAGENTS", raising=False)
     monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
+    monkeypatch.delenv("OUROBOROS_REVIEW_MAX_CYCLES", raising=False)
     # The task's absolute ceiling bounds recorded acceptance durations; a shell
     # export must not move the numbers the pacing tests derive from the getter.
     monkeypatch.delenv("OUROBOROS_TASK_ABS_CEILING_SEC", raising=False)
