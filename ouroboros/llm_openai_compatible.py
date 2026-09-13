@@ -169,12 +169,12 @@ class _OpenAICompatibleLaneMixin:
                     # stable governance prefix on the same cache bucket.
                     kwargs["prompt_cache_key"] = cache_identity
             requested_effort = normalize_reasoning_effort(reasoning_effort)
-            if direct_openai:
-                # Effort-carrying routes honor the OUROBOROS_EFFORT_* lanes
-                # instead of dropping them like generic compatible lanes.
-                # Keyed on the PROVIDER id, not a target capability field, so
-                # a hand-built target (fixtures, probes) cannot silently drop
-                # the carriage; request-wire recovery adapts on a provider 400.
+            if provider in {"openai", "openai-compatible"}:
+                # Chat Completions routes honor the OUROBOROS_EFFORT_* lanes.
+                # Keyed on the PROVIDER id, not a model name or target capability
+                # flag, so a hand-built target cannot silently drop the carriage;
+                # request-wire recovery adapts when a compatible endpoint rejects
+                # this optional field.
                 kwargs["reasoning_effort"] = requested_effort
             elif provider == "deepseek":
                 # Same carriage, projected onto DeepSeek's wire dialect

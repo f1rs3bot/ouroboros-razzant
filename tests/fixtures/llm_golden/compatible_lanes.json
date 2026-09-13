@@ -41,13 +41,14 @@
               }
             ],
             "max_tokens": 1024,
+            "reasoning_effort": "medium",
             "extra_body": {
               "cache": {
                 "no-cache": true
               }
             }
           },
-          "value_sha256": "8bc27cae99d15b0fb0219665b42e06f06d3be5de05ea8d8e0b8eff47d9c13a3d"
+          "value_sha256": "491c5d7a1ff5a61a397fecdf4f531ed846e6e6ebc219b72ad13fcc7bbaba7fb9"
         },
         "sends": [],
         "unused_script_steps": 0
@@ -105,9 +106,10 @@
                 "content": "hello"
               }
             ],
-            "max_tokens": 1024
+            "max_tokens": 1024,
+            "reasoning_effort": "medium"
           },
-          "value_sha256": "c4c7828ccb319c810e06944ee016d0f772f3c9b907efcb0638b6a35e59d66e23"
+          "value_sha256": "876f2ff1fecb13c50fcd09d52258798decddb32dfe0fc0e6b31f66184da91e60"
         },
         "sends": [],
         "unused_script_steps": 0
@@ -177,7 +179,21 @@
             "resolved_model": "openai-compatible/glm-5",
             "cost": 0.0009,
             "cost_estimated": true,
-            "cost_final": false
+            "cost_final": false,
+            "request_wire": {
+              "requested_effort": "medium",
+              "applied_effort": "medium",
+              "requested_tool_dialect": "none",
+              "applied_tool_dialect": "none",
+              "reason_code": "requested_wire_form",
+              "source_profile_fingerprint": "a0ab391ed3f0c3385b29ad33ec5728f09076fe273105479b63f8fc1752afb38e",
+              "accepted_profile_fingerprint": "a0ab391ed3f0c3385b29ad33ec5728f09076fe273105479b63f8fc1752afb38e",
+              "candidate_sha256": "80a7b76daae46aa773c7d5a2e636bda671bc3b5cf9d0b415d80e4aca04544a5e",
+              "ladder_ordinal": 1,
+              "applied_actions": [],
+              "task_local": false,
+              "attempt_id_present": true
+            }
           },
           "ledger_attempt_count": 1
         },
@@ -203,9 +219,10 @@
                   "content": "hello"
                 }
               ],
-              "max_tokens": 65536
+              "max_tokens": 65536,
+              "reasoning_effort": "medium"
             },
-            "payload_sha256": "f34126860e2c88137c2206b0ec6bee0cb61094ccd9fd849a2118713c7a9326bd"
+            "payload_sha256": "80a7b76daae46aa773c7d5a2e636bda671bc3b5cf9d0b415d80e4aca04544a5e"
           }
         ],
         "pricing_calls": [
@@ -228,8 +245,8 @@
             "source": "llm.chat",
             "model": "openai-compatible/glm-5",
             "provider": "openai-compatible",
-            "candidate_raw_sha256": "f34126860e2c88137c2206b0ec6bee0cb61094ccd9fd849a2118713c7a9326bd",
-            "candidate_raw_size_bytes": 134,
+            "candidate_raw_sha256": "80a7b76daae46aa773c7d5a2e636bda671bc3b5cf9d0b415d80e4aca04544a5e",
+            "candidate_raw_size_bytes": 162,
             "candidate_measurement_kind": "canonical_json_v1",
             "states": [
               "reserved",

@@ -473,13 +473,14 @@ def test_malformed_durable_store_fails_open_without_rewrite(evidence_root):
     assert path.read_bytes() == malformed
 
 
-def test_sync_async_exception_and_body_error_driver_parity(evidence_root, tmp_path):
-    target = _target(provider="openai")
+@pytest.mark.parametrize("provider", ["openai", "openai-compatible"])
+def test_sync_async_exception_and_body_error_driver_parity(evidence_root, tmp_path, provider):
+    target = _target(provider=provider)
     client = LLMClient(api_key="unused")
     monkey_payload = _payload(effort="high")
 
     def run_sync(body_error: bool):
-        root = tmp_path / f"wire-sync-{body_error}"
+        root = tmp_path / f"wire-sync-{provider}-{body_error}"
         wire.canonical_wire_evidence_root = lambda: root
         sent = []
 
@@ -496,7 +497,7 @@ def test_sync_async_exception_and_body_error_driver_parity(evidence_root, tmp_pa
             return _Response()
 
         with request_wire_call_scope(), usage_scope(UsageScope(
-            drive_root=tmp_path / f"sync-{body_error}", task_id="sync",
+            drive_root=tmp_path / f"sync-{provider}-{body_error}", task_id="sync",
         )):
             response = client._create_chat_completion_with_retries(
                 create, copy.deepcopy(monkey_payload), target
@@ -507,7 +508,7 @@ def test_sync_async_exception_and_body_error_driver_parity(evidence_root, tmp_pa
         return sent, usage
 
     async def run_async(body_error: bool):
-        root = tmp_path / f"wire-async-{body_error}"
+        root = tmp_path / f"wire-async-{provider}-{body_error}"
         wire.canonical_wire_evidence_root = lambda: root
         sent = []
 
@@ -524,7 +525,7 @@ def test_sync_async_exception_and_body_error_driver_parity(evidence_root, tmp_pa
             return _Response()
 
         with request_wire_call_scope(), usage_scope(UsageScope(
-            drive_root=tmp_path / f"async-{body_error}", task_id="async",
+            drive_root=tmp_path / f"async-{provider}-{body_error}", task_id="async",
         )):
             response = await client._create_chat_completion_with_retries_async(
                 create, copy.deepcopy(monkey_payload), target

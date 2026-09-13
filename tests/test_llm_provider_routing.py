@@ -2,6 +2,10 @@ import pytest
 
 from ouroboros.llm import LLMClient
 from ouroboros.openrouter_attribution import OPENROUTER_APP_HEADERS
+from ouroboros.request_wire_recovery import (
+    prepare_wire_payload_for_send,
+    request_wire_call_scope,
+)
 
 
 def test_resolve_openrouter_target_uses_canonical_app_attribution():
@@ -62,6 +66,31 @@ def test_build_remote_kwargs_uses_current_carriers_provider_wide_for_openai(monk
     assert kwargs["max_completion_tokens"] == 512
     assert kwargs["reasoning_effort"] == "high"
     assert "max_tokens" not in kwargs
+
+
+def test_build_remote_kwargs_carries_effort_for_openai_compatible(monkeypatch):
+    monkeypatch.setenv("OPENAI_COMPATIBLE_BASE_URL", "https://compatible.example/v1")
+
+    client = LLMClient()
+    target = client._resolve_remote_target("openai-compatible::gpt-5.6-sol")
+    with request_wire_call_scope():
+        kwargs = client._build_remote_kwargs(
+            target,
+            [{"role": "user", "content": "hi"}],
+            "high",
+            512,
+            "auto",
+            None,
+            None,
+        )
+        physical = prepare_wire_payload_for_send(
+            target, kwargs, api_surface="chat.completions",
+        )
+
+    assert target["provider"] == "openai-compatible"
+    assert physical["reasoning_effort"] == "high"
+    assert physical["max_tokens"] == 512
+    assert "max_completion_tokens" not in physical
 
 
 def test_build_remote_kwargs_normalizes_tool_descriptions_for_openrouter():

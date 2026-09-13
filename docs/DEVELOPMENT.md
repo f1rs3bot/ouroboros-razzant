@@ -402,10 +402,13 @@ OpenAI tool conversations stay on Chat Completions — custom-first when
 non-`none` reasoning is requested, an exact custom rejection may fall back to
 function with the same effort, and explicit `none` is a task-local last resort
 — and send `reasoning_effort` and `max_completion_tokens` provider-wide;
-model-name prefixes are not admission authority. DeepSeek is the second
-effort-carrying route (`reasoning_effort` beside the compatible-lane
-`max_tokens` carrier): the canonical tiers are projected onto its documented
-`low`/`high`/`max` enum at the send boundary (`minimal`→`low`,
+model-name prefixes are not admission authority. The generic
+`openai-compatible::` Chat Completions route also carries top-level
+`reasoning_effort` beside `max_tokens`; this proves what Ouroboros sends, not
+that an opaque endpoint honors the field, and an exact rejection enters the
+shared request-wire recovery instead of creating a provider-specific switch.
+DeepSeek is another effort-carrying route: the canonical tiers are projected
+onto its documented `low`/`high`/`max` enum at the send boundary (`minimal`→`low`,
 `medium`/`xhigh`→`high`, `ultra`→`max`), `none` becomes
 `extra_body.thinking.type=disabled`, a forced tool choice (`required`/named) is
 served with thinking disabled because thinking mode accepts only `auto`/`none`
