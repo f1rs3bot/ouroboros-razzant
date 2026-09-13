@@ -1359,7 +1359,13 @@ SALVAGED_OUTPUT_NOTE_LIMIT = 4000
 SALVAGED_OUTPUT_DIR = "salvaged"
 
 
-def preserve_salvaged_output(preserve_root: pathlib.Path, task_id: str, text: str) -> str:
+def preserve_salvaged_output(
+    preserve_root: pathlib.Path,
+    task_id: str,
+    text: str,
+    *,
+    identity: str = "",
+) -> str:
     """Write the FULL salvaged text durably under ``preserve_root``; return its path.
 
     The observability root is the drive's durable forensic area
@@ -1370,7 +1376,9 @@ def preserve_salvaged_output(preserve_root: pathlib.Path, task_id: str, text: st
     safe_task = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(task_id or "")).strip("_")
     if not safe_task or not str(text or ""):
         return ""
-    path = _observability_root(pathlib.Path(preserve_root)) / SALVAGED_OUTPUT_DIR / f"{safe_task}.txt"
+    safe_identity = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(identity or "")).strip("_")
+    name = f"{safe_task}.{safe_identity}.txt" if safe_identity else f"{safe_task}.txt"
+    path = _observability_root(pathlib.Path(preserve_root)) / SALVAGED_OUTPUT_DIR / name
     path.parent.mkdir(parents=True, exist_ok=True)
     _chmod_private_dir(path.parent)
     tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")

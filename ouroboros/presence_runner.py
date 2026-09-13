@@ -57,7 +57,10 @@ class PresenceTurnResult:
     work_ref: str = ""
 
 
-def build_presence_result_event(task: dict[str, Any], text: str, ctx: Any, *, provider_notice: str = "") -> dict[str, Any]:
+def build_presence_result_event(
+    task: dict[str, Any], text: str, ctx: Any, *, provider_notice: str = "",
+    terminal_projection: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Freeze typed delivery metadata before the ordinary durable result write."""
 
     completion = getattr(ctx, "_presence_completion", None)
@@ -74,7 +77,11 @@ def build_presence_result_event(task: dict[str, Any], text: str, ctx: Any, *, pr
     )
     if outcome == "deferred" and not work_ref:
         outcome = "message"
-    result_text = str(completion.get("message") or text or "")
+    integrity_rejected = (
+        isinstance(terminal_projection, Mapping)
+        and terminal_projection.get("reason_code") == "model_output_integrity"
+    )
+    result_text = str(text if integrity_rejected else completion.get("message") or text or "")
     if outcome in {"message", "deferred"} and provider_notice:
         from ouroboros.task_finalization import provider_terminal_body
 

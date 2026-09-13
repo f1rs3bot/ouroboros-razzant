@@ -11,11 +11,15 @@ import logging
 import pathlib
 import queue
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from ouroboros.config import get_context_mode
 from ouroboros.outcomes import reviewable_effect_projection
-from ouroboros.task_finalization import set_terminal_host_notice
+from ouroboros.task_finalization import (
+    apply_candidate_terminal_projection,
+    quarantine_model_output_candidate,
+    set_terminal_host_notice,
+)
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.utils import sanitize_tool_result_for_log
 
@@ -62,6 +66,9 @@ class DeliveryCandidate:
     # including ordinary acceptance improvements, so a later control-shaped
     # answer under a lost latch is still read as protocol rather than prose.
     control_episode_seen: bool = False
+    # Terminal facts belong to these exact bytes, not to the task context that
+    # may hold and later replace them.
+    terminal_projection: Dict[str, Any] = field(default_factory=dict)
 
 
 # Action-gate holds: a gate closable ONLY by a tool call (skill lifecycle
@@ -323,6 +330,7 @@ def _replace_delivery_candidate(
     *,
     control: str,
     model_text: Optional[str] = None,
+    terminal_projection: Optional[Dict[str, Any]] = None,
 ) -> DeliveryCandidate:
     full_text = sanitize_tool_result_for_log(full_text)
     model_text = sanitize_tool_result_for_log(
@@ -332,6 +340,8 @@ def _replace_delivery_candidate(
     if (
         isinstance(previous_candidate, _loop().DeliveryCandidate)
         and previous_candidate.full_text == full_text
+        and previous_candidate.model_text == model_text
+        and previous_candidate.terminal_projection == dict(terminal_projection or {})
         and _loop()._current_delivery_candidate(ctx, llm_trace) is previous_candidate
     ):
         previous_candidate.finalization_control = control
@@ -361,10 +371,40 @@ def _replace_delivery_candidate(
         control_episode_seen=bool(
             getattr(previous_candidate, "control_episode_seen", False)
         ),
+        terminal_projection=dict(terminal_projection or {}),
     )
     tools._ctx._delivery_candidate = candidate
     tools._ctx._delivery_control_required = False
     _loop()._publish_delivery_candidate(tools, candidate, llm_trace)
+    return candidate
+
+
+def _replace_model_delivery_candidate(
+    tools: ToolRegistry,
+    ctx: _RoundLimitContext,
+    llm_trace: Dict[str, Any],
+    full_text: str,
+    *,
+    control: str,
+) -> DeliveryCandidate:
+    """Create one model candidate, quarantining the evidenced control leak."""
+
+    raw = str(full_text or "")
+    metadata = getattr(tools._ctx, "task_metadata", {})
+    canonical_root = (
+        metadata.get("budget_drive_root") if isinstance(metadata, dict) else None
+    ) or getattr(tools._ctx, "budget_drive_root", None) or ctx.drive_root
+    safe, projection = quarantine_model_output_candidate(
+        canonical_root, ctx.task_id, raw,
+    )
+    candidate = _replace_delivery_candidate(
+        tools, ctx, llm_trace, safe, control=control,
+        model_text=raw, terminal_projection=projection,
+    )
+    if projection:
+        llm_trace.setdefault("reasoning_notes", []).append(
+            "A leading leaked model control marker was withheld; exact raw bytes were preserved privately."
+        )
     return candidate
 
 
@@ -809,7 +849,7 @@ def _resolve_delivery_control(
         _loop()._publish_delivery_candidate(tools, candidate, llm_trace)
         return "resolved", candidate.full_text
     if valid and control_kind == "replace":
-        updated = _loop()._replace_delivery_candidate(
+        updated = _replace_model_delivery_candidate(
             tools, ctx, llm_trace, replacement, control="replace",
         )
         return "resolved", updated.full_text
@@ -890,7 +930,7 @@ def _no_tool_final_answer(
     content = controlled_content
     _loop()._project_child_result_dispositions(limit_ctx, llm_trace)
     if control_state == "fresh" and str(content or "").strip():
-        candidate = _loop()._replace_delivery_candidate(
+        candidate = _replace_model_delivery_candidate(
             tools, limit_ctx, llm_trace, str(content), control="candidate",
         )
         content = candidate.full_text
@@ -1135,6 +1175,9 @@ def _no_tool_final_answer(
         )
         _loop()._publish_delivery_candidate(tools, candidate, llm_trace)
         content = candidate.full_text
+        apply_candidate_terminal_projection(
+            limit_ctx.accumulated_usage, candidate.terminal_projection,
+        )
     return _loop()._handle_text_response(
         str(content or ""),
         llm_trace,

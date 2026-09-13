@@ -55,7 +55,7 @@ from ouroboros.skill_publish_result import apply_skill_publish_receipt_veto
 from ouroboros.task_finalization import (
     build_sealed_final_package,
     build_swarm_efficiency as _build_swarm_efficiency,  # moved (module ceiling); tests import it here
-    deliver_final_message_live, prepare_terminal_send_event, register_final_answer_owed, stamp_root_final_phase,
+    deliver_final_message_live, prepare_terminal_send_event, quarantine_terminal_model_output, register_final_answer_owed, stamp_root_final_phase,
     sealed_final_prompt_section, terminal_result_fields, terminal_notice_text,  # noqa: F401 -- the pipeline module keeps its historical import surface for the synthesis leaf
 )
 from ouroboros.dialogue_provenance import is_presence_task, presence_provenance_fields  # noqa: F401 -- the pipeline module keeps its historical import surface for the synthesis leaf
@@ -461,6 +461,20 @@ def _apply_terminal_custody_outcome(
         overlaid["reason_code"] = rail
     return overlaid
 
+def _terminal_delivery_event(
+    task: Dict[str, Any], text: str, ctx: Any, usage: Dict[str, Any],
+    send_event: Dict[str, Any], *, presence: bool,
+) -> Dict[str, Any]:
+    """Project one safe terminal candidate onto its selected transport."""
+
+    if not presence:
+        return send_event
+    return build_presence_result_event(
+        task, text, ctx, provider_notice=terminal_notice_text(usage),
+        terminal_projection=usage,
+    )
+
+
 def emit_task_results(
     env: Any, memory: Any, llm: Any,
     pending_events: List[Dict[str, Any]],
@@ -470,6 +484,7 @@ def emit_task_results(
     ctx: Any = None, event_queue: Any = None,
 ) -> None:
     """Emit all end-of-task events to supervisor and run post-task processing."""
+    text = quarantine_terminal_model_output(env.drive_root, task, text, usage)
     from ouroboros.subagent_bootstrap import actor_first_terminal_projection
     actor_fact, usage, llm_trace = actor_first_terminal_projection(ctx, task, usage, llm_trace, task.get("budget_drive_root") or getattr(env, "drive_root", None))
     loop_outcome = _derive_host_bound_loop_outcome(env, task, text, usage, llm_trace)
@@ -509,7 +524,9 @@ def emit_task_results(
         # on a nearby progress row that may age out independently.
         send_event["progress_meta"] = dict(_message_meta)
     send_event = prepare_terminal_send_event(env.drive_root, task, text, usage, send_event, ephemeral=_ephemeral, presence=_presence)
-    pending_events.append(build_presence_result_event(task, text, ctx, provider_notice=terminal_notice_text(usage)) if _presence else send_event)
+    pending_events.append(_terminal_delivery_event(
+        task, text, ctx, usage, send_event, presence=_presence,
+    ))
     duration_sec = round(time.time() - start_time, 3)
     n_tool_calls = len(llm_trace.get("tool_calls", []))
     n_tool_errors = sum(1 for tc in llm_trace.get("tool_calls", [])
@@ -750,7 +767,6 @@ def emit_task_results(
 
             parent_env = SimpleNamespace(repo_dir=env.repo_dir, drive_root=pathlib.Path(budget_drive_root), drive_path=lambda rel: pathlib.Path(budget_drive_root) / rel)
             parent_task = {**task, "drive_root": budget_drive_root, "child_drive_root": str(env.drive_root)}
-
         if not _ephemeral and not _root_post_task_already_completed(env, task):
             _dispatch_root_post_task(
                 env, task, str(send_event.get("text") or ""), event_queue, pending_events,

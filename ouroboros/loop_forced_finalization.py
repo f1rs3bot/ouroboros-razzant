@@ -152,6 +152,12 @@ def _record_forced_finalization(
     # path (`_handle_budget_exceeded` -> `_forced_fallback_result`).
     _loop()._record_forced_acceptance_bypass(ctx, llm_trace, reason_code)
     ctx.accumulated_usage.setdefault("terminal_origin", TERMINAL_ORIGIN_HOST_NOTICE)
+    if candidate is not None:
+        from ouroboros.task_finalization import apply_candidate_terminal_projection
+
+        apply_candidate_terminal_projection(
+            ctx.accumulated_usage, candidate.terminal_projection,
+        )
     binding = dict(candidate.acceptance_binding or {}) if candidate is not None else {}
     tools = getattr(ctx, "tools", None)
     current_fingerprint = str(
@@ -654,12 +660,16 @@ def _publish_model_forced_candidate(
     if tools is None:
         return None
     current = _loop()._current_delivery_candidate(ctx, llm_trace)
-    if current is not None and current.full_text == sanitize_tool_result_for_log(full_text):
+    if (
+        current is not None
+        and current.full_text == sanitize_tool_result_for_log(full_text)
+        and current.model_text == str(full_text or "")
+    ):
         return _loop()._degrade_retained_delivery_candidate(
             ctx, llm_trace, current, control=f"forced_preserve:{reason_code}",
             reason_code=degraded_reason or reason_code,
         )
-    candidate = _loop()._replace_delivery_candidate(
+    candidate = _loop()._replace_model_delivery_candidate(
         tools,
         ctx,
         llm_trace,
@@ -705,6 +715,8 @@ def _publish_stale_forced_candidate(
         llm_trace,
         stale_candidate.full_text,
         control=f"forced_stale_preserve:{reason_code}",
+        model_text=stale_candidate.model_text,
+        terminal_projection=stale_candidate.terminal_projection,
     )
     # A host disclosure cannot make the preserved model text current.
     candidate.evidence_revision = stale_candidate.evidence_revision
@@ -778,7 +790,7 @@ def _forced_fallback_result(
                 ),
                 candidate=candidate,
             )
-            return composed, ctx.accumulated_usage, llm_trace
+            return candidate.full_text, ctx.accumulated_usage, llm_trace
         _loop()._degrade_retained_delivery_candidate(
             ctx,
             llm_trace,

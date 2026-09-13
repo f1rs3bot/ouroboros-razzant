@@ -36,6 +36,7 @@ from ouroboros.usage_accounting import (
     last_physical_attempt_capture,  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
 )
 from ouroboros.task_finalization import (  # noqa: F401 -- historical import surface for the L-B leaves
+    HOST_AUTHORED_TERMINAL_ORIGINS,
     TERMINAL_ORIGIN_HOST_NOTICE,
     TERMINAL_ORIGIN_HOST_SALVAGE,
     TERMINAL_ORIGIN_MODEL_FINAL,
@@ -87,7 +88,8 @@ def _handle_text_response(
     safe_content = sanitize_tool_result_for_log(content or "")
     if safe_content.strip():
         llm_trace["reasoning_notes"].append(safe_content.strip())
-        accumulated_usage["terminal_origin"] = TERMINAL_ORIGIN_MODEL_FINAL
+        if accumulated_usage.get("terminal_origin") not in HOST_AUTHORED_TERMINAL_ORIGINS:
+            accumulated_usage["terminal_origin"] = TERMINAL_ORIGIN_MODEL_FINAL
     return safe_content, accumulated_usage, llm_trace
 
 
@@ -802,6 +804,7 @@ from ouroboros.loop_delivery import (  # noqa: E402, F401 -- intentional public 
     _delivery_acceptance_binding,
     _publish_delivery_candidate,
     _replace_delivery_candidate,
+    _replace_model_delivery_candidate,
     _ensure_explicit_acceptance_binding,
     _forced_unaccepted_binding,
     _live_delivery_candidate,
