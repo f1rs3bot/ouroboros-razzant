@@ -927,11 +927,7 @@ def _record_llm_call_error(
     error: Exception,
     ctx: _LlmErrorContext,
 ) -> bool:
-    """Record and classify an LLM-round exception.
-
-    Emits live/durable error evidence, marks usage as infra-failed, and returns
-    whether the caller must stop retrying the unchanged request.
-    """
+    """Record/classify an LLM-round exception and decide whether to stop it."""
     safe_error = sanitize_tool_result_for_log(repr(error))
     classification = classify_llm_exception(error, safe_error)
     provider_message = _exception_provider_message(error, safe_error)
@@ -1002,6 +998,8 @@ def _record_llm_call_error(
             ctx.accumulated_usage[key] = value
     ctx.accumulated_usage.update(execution_status="infra_failed", reason_code="llm_api_error")
     if classification.kind == "context_overflow":
+        from ouroboros.capability_evidence import learn_prompt_size_bound
+        learn_prompt_size_bound(_exception_body(error), (ctx.context_fit_event_fields or {}))
         overflow_event_type = "local_context_overflow" if isinstance(error, LocalContextTooLargeError) else "remote_context_overflow"
         append_jsonl(ctx.drive_logs / "events.jsonl", {
             "ts": utc_now_iso(), "type": overflow_event_type, **identity, "error": safe_error,

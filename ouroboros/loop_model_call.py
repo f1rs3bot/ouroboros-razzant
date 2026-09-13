@@ -41,6 +41,24 @@ def _loop():
     return loop
 
 
+def _serialized_system_bytes(messages: List[Dict[str, Any]]) -> int:
+    """Byte size of role==system content rendered exactly like llm_attempt's
+    canonical candidate projection (sort_keys/separators/ensure_ascii=False).
+
+    The provider maps `instructions` from the system-role content; the gate
+    compares THAT rendering against a learned bound. No system message → 0
+    (nothing provable, fail-open by design)."""
+    from ouroboros.llm_attempt import _canonical_candidate_bytes
+    parts = [
+        message.get("content")
+        for message in messages or []
+        if isinstance(message, dict) and message.get("role") == "system"
+    ]
+    if not parts:
+        return 0
+    return len(_canonical_candidate_bytes({"system": parts}))
+
+
 def _adopt_fallback_route(
     ctx: Any,
     tools: ToolRegistry,
@@ -640,8 +658,48 @@ def _emit_overflow_retry_skipped(ctx: _RoundModelCallContext, reason: str) -> No
     })
 
 
+def _prompt_size_gate(ctx: _RoundModelCallContext) -> Optional[str]:
+    """Pre-dispatch route-scoped serialized bound (learned from the provider's
+    own typed rejection): None = dispatch may proceed; str = typed skip reason.
+
+    MUST run before `_measure_round_main_fit` can spend a reclaim summarizer —
+    a doomed route still paid a summarizer call before skipping otherwise.
+    Only the provider field we can faithfully project (``instructions``/system
+    role) arms the gate; a violation naming another field stays unbounded."""
+    plan = getattr(ctx, "context_fit_plan", None)
+    route_fp = str(getattr(plan, "route_fp", "") or "")
+    if not route_fp:
+        return None
+    from ouroboros.capability_evidence import (
+        canonical_evidence_root, get_prompt_size_violation,
+    )
+    bound = get_prompt_size_violation(canonical_evidence_root(), route_fp)
+    if not bound:
+        return None
+    max_bytes = int(bound.get("max_bytes") or 0)
+    if max_bytes <= 0:
+        return None
+    param = str(bound.get("param") or "").strip().lower()
+    if param not in {"instructions", "system"}:
+        return None
+    # The provider's own wording accepts length <= maximum; mirror it exactly.
+    if _serialized_system_bytes(getattr(ctx, "messages", None)) > max_bytes:
+        if str(getattr(ctx, "active_context_mode", "") or "") == "low":
+            return "prompt_size_bound_exceeded"
+        # The recorded overflow on THIS route_fp is the route-scoped
+        # authorization for task-local Low (ARCHITECTURE, round calls).
+        _reproject_actual_overflow_low(ctx)
+        if _serialized_system_bytes(getattr(ctx, "messages", None)) > max_bytes:
+            return "prompt_size_bound_exceeded"
+    return None
+
+
 def _call_round_model(ctx: _RoundModelCallContext) -> Tuple[Any, float, str]:
     """Measure, optionally reclaim, dispatch, and recover one Main round."""
+    skip_reason = _prompt_size_gate(ctx)
+    if skip_reason is not None:
+        _emit_overflow_retry_skipped(ctx, skip_reason)
+        return None, 0.0, ctx.active_context_mode
     disposition = _loop()._measure_round_main_fit(ctx, automatic_pass_used=False)
     if disposition is not None:
         key = _fit_key(disposition)

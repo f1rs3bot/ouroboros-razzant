@@ -314,10 +314,12 @@ def _load(drive_root: Any) -> Dict[str, Any]:
         data.setdefault("effort_floors", {})
         data.setdefault("rejected_params", {})
         data.setdefault("token_density", {})
+        data.setdefault("prompt_size_bounds", {})
         return data
     return {
         "probes": {}, "owner_acks": {}, "effort_ceilings": {},
         "effort_floors": {}, "rejected_params": {}, "token_density": {},
+        "prompt_size_bounds": {},
     }
 
 
@@ -491,6 +493,101 @@ def get_effort_floor(drive_root: Any, fingerprint: str) -> str:
         return str(entry.get("floor") or "").strip().lower()
     except Exception:
         return ""
+
+
+# --- Learned serialized prompt-size violations (v7.0.6) -------------------------
+# Route-fingerprint-keyed prompt-size bounds proven by a typed provider rejection
+# (e.g. codex-lb's 400 with code `string_above_max_length`, `param=instructions`,
+# `maximum length N`). Unlike `window_tokens` (a token capacity), this is a
+# SERIALIZED byte count for one rendered field of the physical request once the
+# provider itself reported it. Learned once, route-scoped: every later task on the
+# same route_fp preempts a doomed oversized first call instead of re-paying the
+# classification-and-reproject cycle on each round 1. Entries EXPIRE (providers
+# change field limits independently of releases); a fresh violation re-learns.
+# Fail-open everywhere: any error → no durable knowledge → today's behavior.
+
+_PROMPT_SIZE_BOUNDS_TTL_SEC = 14 * 24 * 3600.0
+
+
+def prompt_size_violation_details(body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Parse the provider rejection body into `{"param", "max_bytes"}`."""
+    import re
+    nested = body.get("error") if isinstance(body, dict) else None
+    for source in ((nested,) if isinstance(nested, dict) else (body,)):
+        if not isinstance(source, dict):
+            continue
+        match = re.search(r"maximum length (\d+)", str(source.get("message") or ""))
+        if match:
+            return {
+                "param": str(source.get("param") or source.get("parameter") or ""),
+                "max_bytes": int(match.group(1)),
+            }
+    return None
+
+
+def learn_prompt_size_bound(body: Dict[str, Any], context_fit_event_fields: Dict[str, Any]) -> None:
+    """Learn the route's serialized bound from a typed provider rejection body."""
+    violation = prompt_size_violation_details(body)
+    route_fp = str((context_fit_event_fields or {}).get("context_route_fp") or "")
+    if violation and route_fp:
+        record_prompt_size_violation(
+            canonical_evidence_root(), route_fp,
+            violation.get("param"), violation.get("max_bytes"),
+        )
+
+
+def record_prompt_size_violation(drive_root: Any, fingerprint: str, param: str, max_bytes: Any) -> None:
+    """Persist the proven serialized bound for a route fingerprint. Lower always
+    wins within its TTL (a route never silently regains size the provider rejected).
+    Best-effort, never raises; missing fp/max is a no-op."""
+    fp = str(fingerprint or "").strip()
+    text_param = str(param or "").strip()
+    try:
+        bound = int(max_bytes)
+    except (TypeError, ValueError):
+        return
+    if not fp or bound <= 0:
+        return
+    try:
+        with _STORE_LOCK:
+            data = _load(drive_root)
+            store = data.setdefault("prompt_size_bounds", {})
+            entry = store.get(fp) or {}
+            prev = entry.get("max_bytes")
+            try:
+                prev_int = int(prev) if prev is not None else 0
+            except (TypeError, ValueError):
+                prev_int = 0
+            if prev_int and _age_seconds(str(entry.get("observed_at") or "")) < _PROMPT_SIZE_BOUNDS_TTL_SEC:
+                bound = min(bound, prev_int)
+            store[fp] = {
+                "max_bytes": bound,
+                "param": text_param or str(entry.get("param") or ""),
+                "observed_at": utc_now_iso(),
+                "reason": "provider_rejected",
+            }
+            _save(drive_root, data)
+    except Exception:
+        log.debug("record_prompt_size_violation failed", exc_info=True)
+
+
+def get_prompt_size_violation(drive_root: Any, fingerprint: str) -> Optional[Dict[str, Any]]:
+    """Return the non-expired proven serialized bound (`{"param", "max_bytes"}`)
+    for a route fingerprint, or None (fail-open: absence, expiry, or any error
+    → None)."""
+    fp = str(fingerprint or "").strip()
+    if not fp:
+        return None
+    try:
+        entry = _load(drive_root).get("prompt_size_bounds", {}).get(fp) or {}
+        if _age_seconds(str(entry.get("observed_at") or "")) >= _PROMPT_SIZE_BOUNDS_TTL_SEC:
+            return None
+        max_bytes = int(entry.get("max_bytes") or 0)
+        if max_bytes <= 0:
+            return None
+        return {"param": str(entry.get("param") or ""), "max_bytes": max_bytes}
+    except Exception:
+        return None
 
 
 # --- Learned rejected request parameters (v6.69.0) ------------------------------
