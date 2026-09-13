@@ -59,6 +59,83 @@ TERMINAL_PLAN_REVIEW_NOTE = (
     "its details remain in the task."
 )
 
+# A literal observed at the start of one corrupted provider generation. This
+# is deliberately a closed evidence-backed vocabulary, not a tokenizer-token
+# pattern or semantic quality filter: technical prose may quote the same text.
+LEAKED_MODEL_CONTROL_MARKERS = ("<|close|>",)
+MODEL_OUTPUT_INTEGRITY_REASON = "model_output_integrity"
+MODEL_OUTPUT_INTEGRITY_NOTICE = (
+    "The model returned an invalid generation containing a leaked control marker. "
+    "The raw response was withheld from chat and preserved privately for diagnosis."
+)
+
+
+def leaked_model_control_marker(text: Any) -> str:
+    """Return the observed marker only when it leads model-authored output."""
+    body = str(text or "").lstrip()
+    return next((marker for marker in LEAKED_MODEL_CONTROL_MARKERS if body.startswith(marker)), "")
+
+
+def quarantine_model_output(
+    preserve_root: Any,
+    task_id: Any,
+    text: Any,
+    usage: Dict[str, Any],
+) -> str:
+    """Withhold one structurally invalid model output and retain exact raw bytes."""
+    raw = str(text or "")
+    marker = leaked_model_control_marker(raw)
+    if not marker:
+        return raw
+    data = raw.encode("utf-8")
+    digest = hashlib.sha256(data).hexdigest()
+    preserved_path = ""
+    preservation_error = ""
+    try:
+        from ouroboros.observability import preserve_salvaged_output
+
+        preserved_path = preserve_salvaged_output(
+            pathlib.Path(preserve_root), str(task_id or ""), raw,
+            identity=f"model-output-{digest}",
+        )
+    except Exception as exc:
+        preservation_error = type(exc).__name__
+        log.warning("Failed to preserve rejected model output", exc_info=True)
+    receipt = {
+        "marker": marker,
+        "sha256": digest,
+        "size_bytes": len(data),
+        "size_chars": len(raw),
+        "path": preserved_path,
+        "preserved": bool(preserved_path),
+    }
+    if preservation_error:
+        receipt["preservation_error"] = preservation_error
+    usage.update({
+        "terminal_origin": TERMINAL_ORIGIN_HOST_NOTICE,
+        "execution_status": "failed",
+        "reason_code": MODEL_OUTPUT_INTEGRITY_REASON,
+        "model_output_integrity": receipt,
+    })
+    notice = MODEL_OUTPUT_INTEGRITY_NOTICE
+    if not preserved_path:
+        notice += " The private preservation step failed; the task details record that gap."
+    return notice
+
+
+def quarantine_terminal_model_output(
+    preserve_root: Any,
+    task: Dict[str, Any],
+    text: Any,
+    usage: Dict[str, Any],
+) -> str:
+    """Defend terminal model-origin projections without rewriting host-authored text."""
+    if str(usage.get("terminal_origin") or "") != TERMINAL_ORIGIN_MODEL_FINAL:
+        return str(text or "")
+    return quarantine_model_output(
+        task.get("budget_drive_root") or preserve_root, task.get("id"), text, usage,
+    )
+
 
 def set_terminal_host_notice(usage: Dict[str, Any], *parts: str) -> None:
     """Keep the current host disclosure beside the answer, never inside its identity."""
@@ -206,6 +283,9 @@ def terminal_result_fields(usage: Dict[str, Any]) -> Dict[str, Any]:
     for key in ("terminal_provider_notice", "terminal_host_notice"):
         if isinstance(usage.get(key), str) and usage[key]:
             fields[key] = usage[key]
+    integrity = usage.get("model_output_integrity")
+    if isinstance(integrity, dict) and integrity:
+        fields["model_output_integrity"] = dict(integrity)
     return fields
 
 

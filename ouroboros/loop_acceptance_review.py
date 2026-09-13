@@ -1142,6 +1142,12 @@ def _run_task_acceptance_review_once(
     _loop()._latch_final_answer_marker(llm_trace, content)
     if getattr(tools._ctx, "_task_acceptance_reviewed", False):
         return False
+    if getattr(tools._ctx, "_model_output_integrity_rejected", False):
+        tools._ctx._model_output_integrity_rejected = False
+        llm_trace["review_decision"] = {
+            "eligibility": "not_eligible", "trigger": "model_output_integrity",
+        }
+        return False
     from ouroboros.review_evidence import acceptance_packet_budget_chars
     from ouroboros.task_results import resolve_task_lineage
 

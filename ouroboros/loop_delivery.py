@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from ouroboros.config import get_context_mode
 from ouroboros.outcomes import reviewable_effect_projection
-from ouroboros.task_finalization import set_terminal_host_notice
+from ouroboros.task_finalization import quarantine_model_output, set_terminal_host_notice
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.utils import sanitize_tool_result_for_log
 
@@ -889,15 +889,30 @@ def _no_tool_final_answer(
         return None
     content = controlled_content
     _loop()._project_child_result_dispositions(limit_ctx, llm_trace)
-    if control_state == "fresh" and str(content or "").strip():
-        candidate = _loop()._replace_delivery_candidate(
-            tools, limit_ctx, llm_trace, str(content), control="candidate",
+    candidate = getattr(tools._ctx, "_delivery_candidate", None)
+    if str(content or "").strip():
+        raw_model_text = _loop()._extract_plain_text_from_content(content)
+        metadata = getattr(tools._ctx, "task_metadata", {})
+        canonical_drive_root = (
+            metadata.get("budget_drive_root")
+            if isinstance(metadata, dict) else None
+        ) or getattr(tools._ctx, "budget_drive_root", None) or limit_ctx.drive_root
+        quarantined = quarantine_model_output(
+            canonical_drive_root, limit_ctx.task_id, raw_model_text,
+            limit_ctx.accumulated_usage,
         )
+        if quarantined != raw_model_text:
+            content = quarantined
+            tools._ctx._model_output_integrity_rejected = True
+            llm_trace["reasoning_notes"].append(
+                "A leading leaked model control marker was withheld; exact raw bytes were preserved privately."
+            )
+        if control_state == "fresh" or quarantined != raw_model_text:
+            candidate = _loop()._replace_delivery_candidate(
+                tools, limit_ctx, llm_trace, str(content), control="candidate",
+            )
+    if isinstance(candidate, _loop().DeliveryCandidate):
         content = candidate.full_text
-    else:
-        candidate = getattr(tools._ctx, "_delivery_candidate", None)
-        if isinstance(candidate, _loop().DeliveryCandidate):
-            content = candidate.full_text
 
     if _loop()._enforce_swarm_actions(
         str(content or ""), messages, tools, llm_trace, emit_progress,

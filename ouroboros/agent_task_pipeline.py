@@ -55,7 +55,7 @@ from ouroboros.skill_publish_result import apply_skill_publish_receipt_veto
 from ouroboros.task_finalization import (
     build_sealed_final_package,
     build_swarm_efficiency as _build_swarm_efficiency,  # moved (module ceiling); tests import it here
-    deliver_final_message_live, prepare_terminal_send_event, register_final_answer_owed, stamp_root_final_phase,
+    deliver_final_message_live, prepare_terminal_send_event, quarantine_terminal_model_output, register_final_answer_owed, stamp_root_final_phase,
     sealed_final_prompt_section, terminal_result_fields, terminal_notice_text,  # noqa: F401 -- the pipeline module keeps its historical import surface for the synthesis leaf
 )
 from ouroboros.dialogue_provenance import is_presence_task, presence_provenance_fields  # noqa: F401 -- the pipeline module keeps its historical import surface for the synthesis leaf
@@ -470,6 +470,7 @@ def emit_task_results(
     ctx: Any = None, event_queue: Any = None,
 ) -> None:
     """Emit all end-of-task events to supervisor and run post-task processing."""
+    text = quarantine_terminal_model_output(env.drive_root, task, text, usage)
     from ouroboros.subagent_bootstrap import actor_first_terminal_projection
     actor_fact, usage, llm_trace = actor_first_terminal_projection(ctx, task, usage, llm_trace, task.get("budget_drive_root") or getattr(env, "drive_root", None))
     loop_outcome = _derive_host_bound_loop_outcome(env, task, text, usage, llm_trace)
