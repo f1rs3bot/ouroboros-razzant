@@ -167,3 +167,140 @@ def test_logical_deadline_before_wait_prevents_sleep_and_second_send(
     assert result.actors[0]["status"] == "error"
     assert result.actors[0]["error"] == "transient timeout"
     assert result.actors[0]["usage"]["review_retry_stop_reason"] == "deadline"
+
+def test_rate_limit_reset_uses_one_bounded_wait_then_same_route_resend(
+    tmp_path, monkeypatch,
+):
+    from openai import APIStatusError
+    from httpx import Headers, Request, Response
+    import time
+
+    waits = []
+
+    def _wait(seconds, wake_check):
+        waits.append(seconds)
+        assert wake_check() is False
+        return False
+
+    monkeypatch.setattr("ouroboros.loop_transport.interruptible_wait_sleep", _wait)
+
+    future = str(int((time.time() + 9) * 1000))
+    request = Request("POST", "https://example.invalid")
+
+    class _RateLimitedLLM:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                raise APIStatusError(
+                    "throttle",
+                    response=Response(
+                        429,
+                        headers=Headers({"X-RateLimit-Reset": future}),
+                        request=request,
+                    ),
+                    body=None,
+                )
+            return ({"content": '{"verdict":"PASS","findings":[]}'}, {})
+
+    llm = _RateLimitedLLM()
+    result = run_review_request(
+        _request("reset-aware-wait"), slots=[_slot()], drive_root=tmp_path, llm=llm,
+    )
+
+    assert result.aggregate_signal == "PASS"
+    assert len(llm.calls) == 2
+    assert len(waits) == 1
+    assert 0 < waits[0] <= 60.0
+    assert llm.calls[0] == llm.calls[1]
+
+
+def test_rate_limit_reset_survives_as_typed_failure_evidence(
+    tmp_path, monkeypatch,
+):
+    from openai import APIStatusError
+    from httpx import Headers, Request, Response
+    import time
+
+    monkeypatch.setattr(
+        "ouroboros.loop_transport.interruptible_wait_sleep",
+        lambda seconds, wake_check: False,
+    )
+
+    future = str(int((time.time() + 9) * 1000))
+    request = Request("POST", "https://example.invalid")
+
+    class _FailsTwiceLLM:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, **kwargs):
+            self.calls.append(kwargs)
+            raise APIStatusError(
+                "throttle",
+                response=Response(
+                    429,
+                    headers=Headers({"X-RateLimit-Reset": future}),
+                    request=request,
+                ),
+                body=None,
+            )
+
+    llm = _FailsTwiceLLM()
+    result = run_review_request(
+        _request("reset-typed-failure"), slots=[_slot()],
+        drive_root=tmp_path, llm=llm,
+    )
+
+    assert result.actors[0]["status"] == "error"
+    assert result.actors[0]["http_status"] == 429
+    assert result.actors[0]["reset_at"] == future
+    assert len(llm.calls) == 2
+
+
+def test_rate_limit_fallback_stays_four_seconds_without_valid_reset(
+    tmp_path, monkeypatch,
+):
+    from openai import APIStatusError
+    from httpx import Headers, Request, Response
+    import time
+
+    waits = []
+    monkeypatch.setattr(
+        "ouroboros.loop_transport.interruptible_wait_sleep",
+        lambda seconds, wake_check: waits.append(seconds) or False,
+    )
+
+    request = Request("POST", "https://example.invalid")
+    past = str(int((time.time() - 9) * 1000))
+
+    class _FlakyLLM:
+        def __init__(self, reset_value):
+            self.calls = []
+            self.reset_value = reset_value
+
+        def chat(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                raise APIStatusError(
+                    "throttle",
+                    response=Response(
+                        429,
+                        headers=Headers({"X-RateLimit-Reset": self.reset_value}),
+                        request=request,
+                    ),
+                    body=None,
+                )
+            return ({"content": '{"verdict":"PASS","findings":[]}'}, {})
+
+    for reset_value in (past, "bad-token"):
+        llm = _FlakyLLM(reset_value)
+        result = run_review_request(
+            _request(f"flat-four-{reset_value}"), slots=[_slot()],
+            drive_root=tmp_path, llm=llm,
+        )
+        assert result.aggregate_signal == "PASS"
+        assert len(llm.calls) == 2
+        assert waits[-1] == 4.0

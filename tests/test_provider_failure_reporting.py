@@ -588,6 +588,63 @@ def test_permanent_classes_still_fail_fast(tmp_path, monkeypatch):
     assert usage["_last_llm_error_kind"] == "auth_error"
 
 
+def test_rate_limit_reset_metadata_becomes_a_typed_recovery_fact():
+    from openai import APIStatusError
+    from httpx import Headers, Request, Response
+    import time
+
+    request = Request("POST", "https://example.invalid")
+    future = str(int((time.time() + 9) * 1000))
+    exc = APIStatusError(
+        "throttle",
+        response=Response(
+            429,
+            headers=Headers({"X-RateLimit-Reset": future}),
+            request=request,
+        ),
+        body=None,
+    )
+    classification = classify_llm_exception(exc)
+
+    assert classification.kind == "provider_transient"
+    assert classification.retry_after_sec is not None
+    assert 0 < classification.retry_after_sec <= 60
+    assert classification.reset_at == future
+
+
+def test_rate_limit_reset_ignores_malformed_and_past_facts():
+    from openai import APIStatusError
+    from httpx import Headers, Request, Response
+    import time
+
+    request = Request("POST", "https://example.invalid")
+    past = str(int((time.time() - 9) * 1000))
+    malformed = APIStatusError(
+        "throttle",
+        response=Response(
+            429,
+            headers=Headers({"X-RateLimit-Reset": "bad-token"}),
+            request=request,
+        ),
+        body=None,
+    )
+    past_failure = APIStatusError(
+        "throttle",
+        response=Response(
+            429,
+            headers=Headers({"X-RateLimit-Reset": past}),
+            request=request,
+        ),
+        body=None,
+    )
+
+    for exc in (malformed, past_failure):
+        classification = classify_llm_exception(exc)
+        assert classification.kind == "provider_transient"
+        assert classification.retry_after_sec is None
+        assert classification.reset_at == ""
+
+
 def test_classify_llm_exception_distinguishes_retryable_rate_limit():
     rate = classify_llm_exception(RuntimeError("429 rate limit exceeded"))
     quota = classify_llm_exception(RuntimeError("402 insufficient credits"))

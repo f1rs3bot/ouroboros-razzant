@@ -45,9 +45,10 @@ import logging
 import os
 import pathlib
 import queue
+import math
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ouroboros.config import (
     NETWORK_WAIT_BACKOFF_START_SEC,
@@ -56,7 +57,7 @@ from ouroboros.config import (
     get_task_idle_timeout_sec,
 )
 from ouroboros.deadline_utils import parse_deadline_ts
-from ouroboros.loop_llm_call import TRANSPORT_DEATHS_KEY, _TRANSIENT_BACKOFF_CAP_SEC
+from ouroboros.loop_llm_call import TRANSPORT_DEATHS_KEY, _TRANSIENT_BACKOFF_CAP_SEC, _exception_body
 from ouroboros.model_slots import get_limit_fallback_policy, limit_blocks_fallback
 from ouroboros.owner_mailbox import OwnerMailboxPeek
 from ouroboros.utils import append_jsonl, utc_now_iso
@@ -832,3 +833,68 @@ def provider_recovery_hint(accumulated_usage: Dict[str, Any]) -> str:
             "be transient, but it can also indicate malformed client input."
         )
     return " If background consciousness is running, it will retry when the provider recovers."
+# A rate-limit reset is classified only from structured future facts, never from prose.
+# Nested metadata/openrouter headers map to epoch milliseconds; uncertain or past values
+# continue on the conservative generic transient path.
+_RATE_LIMIT_EPOCH_MS_THRESHOLD = 100_000_000_000
+
+
+def _exception_reset_candidates(exc: Exception) -> List[Tuple[str, str]]:
+    """Structured reset fields carrying their own source semantics."""
+    candidates: List[Tuple[str, str]] = []
+
+    def _add(value: Any, source: str) -> None:
+        text = str(value or "").strip()
+        if text:
+            candidates.append((text, source))
+
+    def _headers(source_map: Any, source: str) -> None:
+        if isinstance(source_map, dict) or hasattr(source_map, "get"):
+            try:
+                _add(
+                    source_map.get("Retry-After") or source_map.get("retry-after"),
+                    "Retry-After",
+                )
+                _add(
+                    source_map.get("X-RateLimit-Reset")
+                    or source_map.get("x-ratelimit-reset")
+                    or source_map.get("X-Rate-Limit-Reset"),
+                    "X-RateLimit-Reset",
+                )
+            except Exception:
+                pass
+
+    response = getattr(exc, "response", None)
+    _headers(getattr(response, "headers", None), "exception.response.headers")
+    body = _exception_body(exc)
+    nested = body.get("error")
+    for source in ((nested if isinstance(nested, dict) else body), body):
+        metadata = source.get("metadata") if isinstance(source, dict) else None
+        metadata_headers = metadata.get("headers") if isinstance(metadata, dict) else None
+        if isinstance(metadata_headers, dict):
+            _headers(metadata_headers, "body.metadata.headers")
+    return candidates
+
+
+def _rate_limit_recovery_data(exc: Exception) -> Tuple[Optional[float], str]:
+    """Return (delay, original reset text) for a future structured reset fact."""
+    candidates = _exception_reset_candidates(exc)
+    if not candidates:
+        return None, ""
+    for candidate, source in candidates:
+        try:
+            numeric = float(str(candidate).strip())
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(numeric) or numeric <= 0:
+            continue
+        if source == "Retry-After":
+            return numeric, str(candidate).strip()
+        if source == "X-RateLimit-Reset":
+            epoch = numeric / 1000.0 if numeric >= _RATE_LIMIT_EPOCH_MS_THRESHOLD else numeric
+            delay = epoch - time.time() if epoch > time.time() else 0.0
+            if delay > 0:
+                return delay, str(candidate).strip()
+    return None, ""
+
+

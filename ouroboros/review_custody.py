@@ -685,6 +685,16 @@ def retryable_review_exception(
         return False
 
     classification = classify_llm_exception(exc)
+    if classification.reset_at:
+        try:
+            exc.reset_at = classification.reset_at
+        except Exception:
+            pass
+    if classification.retry_after_sec is not None:
+        try:
+            exc._last_llm_retry_after_sec = classification.retry_after_sec
+        except Exception:
+            pass
     if classification.kind == "provider_outcome_unknown":
         if usage_ctx is not None:
             setattr(usage_ctx, "_review_custody_lost", True)

@@ -193,13 +193,14 @@ def review_usage_category(surface: str) -> str:
 
 def _review_retry_wait_outcome(
     usage_ctx: Any, logical_deadline_monotonic: Optional[float],
+    retry_after_sec: Optional[float] = None,
 ) -> str:
     """Pace one already-authorized review resend without widening its rail.
 
-    The main-loop backoff function owns the initial transient delay, while the
-    transport wait owns interruptible sleeping.  Review keeps only the policy
-    decision that its one retryable-exception resend uses those primitives.
-    Empty-output and format-repair resends never call this seam.
+    A structured reset fact accepted by ``classify_llm_exception`` may bound the
+    one same-route wait. Every malformed, absent, past, or ambiguous fact keeps
+    the historical generic four-second transient; the deadline/cancellation
+    fences below stay exactly the same.
     """
     if review_retry_cancelled(usage_ctx):
         return "cancelled"
@@ -211,6 +212,8 @@ def _review_retry_wait_outcome(
     from ouroboros.loop_transport import interruptible_wait_sleep
 
     delay = _retry_backoff_sec({}, "provider_transient", 0, True)
+    if isinstance(retry_after_sec, (int, float)) and retry_after_sec and retry_after_sec > 0:
+        delay = min(float(retry_after_sec), 60.0)
     if (
         logical_deadline_monotonic is not None
         and logical_deadline_monotonic - now < delay
@@ -670,6 +673,7 @@ class ReviewCoordinator:
                         if actor_attempt + 1 < actor_attempts:
                             wait_outcome = _review_retry_wait_outcome(
                                 self.usage_ctx, logical_deadline_monotonic,
+                                getattr(exc, "_last_llm_retry_after_sec", None),
                             )
                             if wait_outcome != "ready":
                                 try:

@@ -558,8 +558,6 @@ _RETRYABLE_PROVIDER_CODES = frozenset({"rate_limit_exceeded"})
 # body carries `code: "cyber_policy"`): permanent for this exact request, so the
 # owner's cross-model chain answers it. Narrow: "invalid_request" stays bad_request.
 _PROVIDER_POLICY_REFUSAL_CODES = frozenset({"cyber_policy", "content_policy_violation", "moderation_blocked", "content_filter", "guardrails", "safety_refusal"})
-
-
 def _is_rate_limit_text(text: str) -> bool:
     low = str(text or "").lower()
     return any(marker in low for marker in _RATE_LIMIT_TEXT_MARKERS)
@@ -756,19 +754,21 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
     if provider_code.lower() in _STRUCTURED_CONTEXT_OVERFLOW_CODES:
         return LlmErrorClassification("context_overflow", False, status_code, provider_code)
     provider_kind = _provider_code_kind(provider_code)
-    # Named codes and numeric auth/quota codes are typed authority. Only a
-    # numeric code that maps to generic bad_request defers to the semantic body
-    # classifiers below, which can distinguish output/context failures.
+    # Rate-limit reset metadata is extracted before the numeric bad-request rails: a
+    # numeric HTTP code alone cannot distinguish a throttle from an invalid request.
     generic_numeric_bad_request = (
         provider_kind == "bad_request" and provider_code == "400"
     )
     if provider_kind and not generic_numeric_bad_request:
         return LlmErrorClassification(provider_kind, False, status_code, provider_code)
-    if provider_code.lower() in _RETRYABLE_PROVIDER_CODES:
-        return LlmErrorClassification("provider_transient", True, status_code, provider_code)
-    if status_code == 429:
-        return LlmErrorClassification("provider_transient", True, status_code, provider_code)
-    if _is_rate_limit_text(low):
+    from ouroboros.loop_transport import _rate_limit_recovery_data
+    recovery_delay, recovery_raw = _rate_limit_recovery_data(exc)
+    if provider_code.lower() in _RETRYABLE_PROVIDER_CODES or status_code == 429 or _is_rate_limit_text(low):
+        if recovery_delay is not None:
+            return LlmErrorClassification(
+                "provider_transient", True, status_code, provider_code,
+                retry_after_sec=recovery_delay, reset_at=recovery_raw,
+            )
         return LlmErrorClassification("provider_transient", True, status_code, provider_code)
     if _output_or_body_size_message(low):
         return LlmErrorClassification("request_too_large", False, status_code, provider_code)
