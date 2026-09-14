@@ -1,4 +1,4 @@
-# Ouroboros v7.0.14 — Architecture & Reference
+# Ouroboros v7.0.15 — Architecture & Reference
 
 This file is NOT a changelog. Version history lives in README.md, git tags, and commit log.
 
@@ -417,8 +417,8 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── plan_review_references.py ← Reference projection that also writes its own provenance rows (`append_jsonl` into `logs/progress.jsonl`, `emit_log_event`), never a second plan authority
       │   ├── plan_review.py   ← `plan_task` engine: evidence, packet, fan-out over the review substrate, `plan_review_state` v2, the shared `OUROBOROS_REVIEW_MAX_CYCLES` cap, free identical replays; no scouts, Atlas, or plan_class
       │   ├── plan_review_runtime.py ← Plan-review deadline rail, `ReviewSlot` rows, `plan_slot_fit` + `preflight_oversize`, health snapshot + `plan_wave_replay_decision`, `plan_review_advisory_open` emitter
-      │   ├── plan_spec.py     ← Pure plan-spec parsing/aggregation (`resolve_constitutional`); no I/O
-      │   ├── plan_evidence.py ← Bounded plan-evidence manifest; the runtime data plane is denied
+      │   ├── plan_spec.py     ← Pure plan-spec parsing/aggregation (`resolve_constitutional`) and plan-request fingerprint identity; no I/O
+      │   ├── plan_evidence.py ← Bounded plan-evidence manifest + live runtime-data/settings deny-path policy
       │   ├── plan_packet.py   ← Reviewer packet; the W3 governance pack inlines BIBLE + ARCHITECTURE in full for self-modification plans, nav maps otherwise
       │   ├── plan_work_items.py ← Work-item reference authority: bounded normalized `spec.work_item_refs`, evolution-only `ibl-*` open-backlog validation, current-closed-wave binding, and transaction intent readers; omitted refs preserve legacy fallback while an explicit empty list replaces it
       │   ├── plan_render.py   ← Wave view + `PLAN_REVIEW_CONTROL_JSON` footer; no independent behaviour

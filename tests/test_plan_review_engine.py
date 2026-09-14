@@ -1352,9 +1352,10 @@ def test_session_output_schema_for_plan_review_can_carry_a_blocking_finding():
 
 
 def test_engine_denies_the_runtime_data_plane_as_evidence(harness, tmp_path, monkeypatch):
-    """Audit R9: `_evidence_deny_paths` is wired — the live data root is refused whatever
+    """Audit R9: `evidence_deny_paths` is wired — the live data root is refused whatever
     root the caller declares."""
     from ouroboros import config as cfg
+    from ouroboros.tools import plan_evidence
 
     data_root = tmp_path / "live_data"
     data_root.mkdir()
@@ -1362,7 +1363,7 @@ def test_engine_denies_the_runtime_data_plane_as_evidence(harness, tmp_path, mon
     monkeypatch.setattr(cfg, "DATA_DIR", data_root, raising=False)
     monkeypatch.setattr(cfg, "SETTINGS_PATH", data_root / "settings.json", raising=False)
     ctx = harness.make_ctx()
-    denied = pr._evidence_deny_paths(ctx)
+    denied = plan_evidence.evidence_deny_paths(ctx)
     assert any(str(data_root) in d for d in denied)
 
 

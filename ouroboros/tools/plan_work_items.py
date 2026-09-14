@@ -11,38 +11,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-def plan_fingerprint(goal: str, plan: str, spec: dict, manifest_hash: str, constitutional: bool) -> str:
-    """Identity of one review request: goal, prose, canonical spec, evidence identity,
-    the constitutional fact — never the exploration log (it changes no obligation)."""
-    from hashlib import sha256
-    import json
-
-    payload = {"goal": goal, "plan": plan, "spec": spec, "evidence_manifest_hash": manifest_hash,
-               "constitutional": bool(constitutional)}
-    return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
-
 
 WORK_ITEM_ID_LIMIT = 20
-
-
-def evidence_deny_paths(ctx: Any) -> list[str]:
-    """Plan-evidence deny paths: runtime data and the live settings file are a boundary."""
-    from ouroboros import config
-
-    out: list[str] = []
-    for value in (getattr(config, "SETTINGS_PATH", ""), getattr(config, "DATA_DIR", "")):
-        text = str(value or "").strip()
-        if text:
-            out.append(text)
-    try:
-        from ouroboros.tool_access import canonical_data_root
-
-        drive = canonical_data_root(ctx)
-        if drive:
-            out.append(str(drive))
-    except Exception:
-        pass
-    return out
 
 _MISSING = object()
 

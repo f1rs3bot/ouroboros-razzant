@@ -1,5 +1,7 @@
-"""Evidence manifest for ``plan_task`` — pure functions, bounded I/O on
-agent-declared locators only (companion of ``ouroboros.tools.plan_spec``).
+"""Evidence manifest and deny-path policy for ``plan_task``.
+
+Manifest assembly is pure apart from bounded I/O on agent-declared locators;
+``evidence_deny_paths`` reads the caller's live runtime-data boundaries.
 
 Bounds (every cut disclosed, never silent): ``EVIDENCE_PER_ITEM_BYTES`` /
 ``EVIDENCE_TOTAL_BYTES`` — attached text per locator and per packet (~10k /
@@ -44,6 +46,26 @@ _SELECTOR_RE = re.compile(
     r"(?:bytes=(?P<byte_start>[0-9]+)-(?P<byte_end>[0-9]+))|"
     r"(?:tail=(?P<tail>[1-9][0-9]*))|(?:symbol=(?P<symbol>[A-Za-z_][A-Za-z0-9_.]*)))$"
 )
+
+
+def evidence_deny_paths(ctx: Any) -> list[str]:
+    """Paths evidence may never attach: live settings and runtime data."""
+    from ouroboros import config
+
+    out: list[str] = []
+    for value in (getattr(config, "SETTINGS_PATH", ""), getattr(config, "DATA_DIR", "")):
+        text = str(value or "").strip()
+        if text:
+            out.append(text)
+    try:
+        from ouroboros.tool_access import canonical_data_root
+
+        drive = canonical_data_root(ctx)
+        if drive:
+            out.append(str(drive))
+    except Exception:
+        pass
+    return out
 
 
 def _split_selector(locator: str) -> tuple[str, Optional[dict], Optional[str]]:

@@ -2,7 +2,7 @@
 
 Owner-approved redesign (2026-08-15, plan §6/§7): the agent submits a SPEC (goal,
 in_scope, non_goals, acceptance_claims, invariants, decisions, deferred,
-affected_resources, evidence) plus prose; the host normalizes it (``plan_spec``),
+affected_resources, evidence, optional work_item_refs) plus prose; the host normalizes it (``plan_spec``),
 resolves ONE structural fact (``constitutional``), attaches the declared evidence
 bounded with every omission named, builds the lean packet (``plan_packet``), fans it
 across the configured reviewer rows through the shared review substrate (api_chat
@@ -399,15 +399,6 @@ def _planning_state_location(ctx: ToolContext) -> tuple[pathlib.Path, str]:
 # ------------------------------------------------------------------- inputs / packet
 
 
-def _evidence_deny_paths(ctx: ToolContext) -> list[str]:
-    """Paths evidence may never attach, whatever root the caller declares (C-06): the runtime
-    data plane and the live settings file are a boundary, not a heuristic — an operator subject
-    root one level above them would otherwise make owner credentials reviewable."""
-    from ouroboros.tools.plan_work_items import evidence_deny_paths
-
-    return evidence_deny_paths(ctx)
-
-
 def _task_evidence_reader(root: pathlib.Path) -> Callable[[str], Optional[str]]:
     """Task-result projection; the evidence resolver hashes, budgets and redacts it."""
     def _read(task_id: str) -> Optional[str]:
@@ -505,7 +496,8 @@ def _prepare_plan_inputs(ctx: ToolContext, request: "_PlanRequest", state_root: 
     manifest = plan_evidence.resolve_evidence(
         host_locators + declared_evidence, active_root=active_root,
         allowed_roots=[active_root, system_root],
-        resolve_task=_task_evidence_reader(state_root), deny_paths=_evidence_deny_paths(ctx),
+        resolve_task=_task_evidence_reader(state_root),
+        deny_paths=plan_evidence.evidence_deny_paths(ctx),
     )
     manifest["declared"] = declared_evidence  # the AGENT's list; requests below (tagged+hashed)
     if reviewer_requested:
@@ -515,9 +507,9 @@ def _prepare_plan_inputs(ctx: ToolContext, request: "_PlanRequest", state_root: 
         manifest.setdefault("omissions", []).extend(
             {"locator": loc, "reason": "reviewer_request_cap"} for loc in request_dropped)
     manifest_hash = plan_evidence.evidence_manifest_hash(manifest)
-    from ouroboros.tools.plan_work_items import plan_fingerprint
-
-    fingerprint = plan_fingerprint(spec["goal"], request.plan, spec, manifest_hash, constitutional)
+    fingerprint = plan_spec.plan_fingerprint(
+        spec["goal"], request.plan, spec, manifest_hash, constitutional,
+    )
     return {
         "spec": spec, "system_root": system_root, "active_root": active_root,
         "constitutional": constitutional, "constitutional_note": constitutional_note,

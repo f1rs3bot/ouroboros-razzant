@@ -286,6 +286,18 @@ def _canonical_hash(payload: Any) -> str:
     return sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def plan_fingerprint(
+    goal: str, plan: str, spec: dict, manifest_hash: str, constitutional: bool,
+) -> str:
+    """Identity of one plan-review request, preserving its historical JSON wire."""
+    payload = {
+        "goal": goal, "plan": plan, "spec": spec,
+        "evidence_manifest_hash": manifest_hash, "constitutional": bool(constitutional),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def spec_hash(spec: Mapping[str, Any]) -> str:
     """sha256 over canonical JSON (sorted keys, compact separators): stable under key order/whitespace."""
     return _canonical_hash(dict(spec))

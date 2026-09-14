@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from types import SimpleNamespace
 
-from ouroboros.tools import plan_spec, plan_work_items
+from ouroboros.tools import plan_evidence, plan_spec, plan_work_items
 
 
 def _spec(refs_marker: str) -> dict:
@@ -35,6 +37,31 @@ def test_work_item_refs_malformed_are_typed_errors():
     assert errors == ["work_item_refs[1]: must be a string"]
     _spec_value, errors = plan_spec.normalize_spec({"goal": "g", "work_item_refs": "ibl-1"})
     assert errors == ["work_item_refs: must be an array of strings"]
+
+
+def test_plan_fingerprint_preserves_historical_json_wire():
+    spec = {"goal": "goal", "work_item_refs": ["ibl-1"]}
+    payload = {
+        "goal": "goal", "plan": "plan", "spec": spec,
+        "evidence_manifest_hash": "a" * 64, "constitutional": True,
+    }
+    expected = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    assert expected == "0b60598964435a945eb5a4f138e32566566b1f5c654e4969e73309c858a0524f"
+    assert plan_spec.plan_fingerprint("goal", "plan", spec, "a" * 64, True) == expected
+
+
+def test_plan_evidence_deny_paths_owns_runtime_boundaries(tmp_path, monkeypatch):
+    from ouroboros import config as cfg
+
+    data_root = tmp_path / "data"
+    settings = data_root / "settings.json"
+    monkeypatch.setattr(cfg, "DATA_DIR", data_root, raising=False)
+    monkeypatch.setattr(cfg, "SETTINGS_PATH", settings, raising=False)
+    denied = plan_evidence.evidence_deny_paths(SimpleNamespace(drive_root=data_root))
+    assert str(data_root) in denied
+    assert str(settings) in denied
 
 
 def test_evolution_refs_validate_against_open_backlog(tmp_path):
