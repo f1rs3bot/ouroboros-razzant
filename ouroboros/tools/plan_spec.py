@@ -48,9 +48,10 @@ AGGREGATES = ("GREEN", "REVIEW_REQUIRED", "REVISE_PLAN", "DEGRADED")
 DISPOSITION_DECISIONS = ("accept", "reject", "defer")
 
 _SPEC_STRING_LISTS = ("in_scope", "non_goals", "invariants", "affected_resources", "evidence")
+_WORK_ITEM_KEY = "work_item_refs"
 _SPEC_KEYS = frozenset({
     "goal", "in_scope", "non_goals", "acceptance_claims", "invariants",
-    "decisions", "deferred", "affected_resources", "evidence",
+    "decisions", "deferred", "affected_resources", "evidence", _WORK_ITEM_KEY,
 })
 _URL_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
 _FILE_SCHEME = "file://"
@@ -231,15 +232,25 @@ def normalize_spec(raw: Mapping[str, Any] | None) -> tuple[dict, list[str]]:
     spec: dict[str, Any] = {"goal": goal}
     for key in _SPEC_STRING_LISTS:
         spec[key] = _string_list(raw.get(key), key, errors, omissions)
+    from ouroboros.tools import plan_work_items
+
+    if _WORK_ITEM_KEY in raw:
+        refs, error = plan_work_items.normalize_work_item_refs(raw.get(_WORK_ITEM_KEY))
+        if error:
+            errors.append(error)
+        else:
+            spec[_WORK_ITEM_KEY] = refs
     seen = {GOAL_ID, *(f"invariant_{i}" for i in range(1, len(spec["invariants"]) + 1))}
     spec["acceptance_claims"] = _normalize_claims(raw.get("acceptance_claims"), errors, omissions, seen)
     spec["decisions"] = _normalize_decisions(raw.get("decisions"), errors, omissions, seen)
     spec["deferred"] = _normalize_deferred(raw.get("deferred"), errors, omissions, seen)
     spec["normalization_omissions"] = omissions
-    ordered = {key: spec[key] for key in (
+    ordered_keys = [
         "goal", "in_scope", "non_goals", "acceptance_claims", "invariants", "decisions",
-        "deferred", "affected_resources", "evidence", "normalization_omissions",
-    )}
+        "deferred", "affected_resources", "evidence", _WORK_ITEM_KEY, "normalization_omissions",
+    ]
+    ordered_keys = [key for key in ordered_keys if key == "normalization_omissions" or key in spec]
+    ordered = {key: spec[key] for key in ordered_keys}
     return ordered, errors
 
 

@@ -1356,6 +1356,7 @@ def build_evolution_task_text(cycle: int) -> str:
         "- Work as a normal Ouroboros self-improvement task.",
         "- Use standard tests and the normal advisory + triad + scope review flow before committing code.",
         "- Land at most ONE reviewed self-modification commit in this cycle. Fold reviewer fixes into that commit before committing; do not churn follow-up commits.",
+        "- If this cycle's reviewed commit resolves specific improvement-backlog items, declare their exact `ibl-…` ids in `spec.work_item_refs` when calling plan_task; only refs carried by the current closed plan wave into the commit intent may close after restart verification.",
         "- After a reviewed commit lands, call request_restart once and stop. Restart verification is the absorption boundary for the cycle.",
         "- An honest no-op is a legitimate outcome when the objective is unsafe, already solved, too broad, or needs owner input; do not commit just to make a cycle non-empty.",
         "- If the best next step is memory/identity/backlog rather than code, update those durable artifacts with provenance, but do not treat that as an absorbed self-evolution cycle.",

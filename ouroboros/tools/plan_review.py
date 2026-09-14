@@ -31,7 +31,6 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextvars
-from hashlib import sha256
 import json
 import logging
 import pathlib
@@ -196,6 +195,13 @@ _SPEC_SCHEMA = {
                 "does not exist does not, and the skip is disclosed."
             ),
         },
+        "work_item_refs": {
+            "type": "array", "items": {"type": "string"},
+            "description": (
+                "Optional bounded reference list. Omission is no modern binding (legacy applies); "
+                "explicit [] is authoritative replacement authority."
+            ),
+        },
     },
 }
 
@@ -326,6 +332,19 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
     request = _PlanRequest(
         goal=str(params.get("goal") or ""), plan=str(params.get("plan") or ""), spec=params.get("spec"),
     )
+    metadata = getattr(ctx, "task_metadata", None) or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    if isinstance(params.get("spec"), dict) and "work_item_refs" in params["spec"] and \
+            "evolution_transaction" in metadata:
+        from ouroboros.tools.plan_work_items import normalize_work_item_refs, validate_evolution_work_item_refs
+
+        refs, error = normalize_work_item_refs(params["spec"].get("work_item_refs"))
+        if error:
+            return _typed_refusal(ctx, "TOOL_ARG_ERROR", "ERROR: PLAN_SPEC_INVALID: " + error + ". No reviewer was called.")
+        error = validate_evolution_work_item_refs(ctx.drive_root, refs or [])
+        if error:
+            return _typed_refusal(ctx, "TOOL_ARG_ERROR", "ERROR: PLAN_SPEC_INVALID: " + error + ". No reviewer was called.")
     # The ToolEntry envelope is the outer settlement bound. The substrate
     # owns each review slot's logical window and late-result custody; nesting a
     # second asyncio.wait_for here only cancels the coroutine while its
@@ -384,30 +403,9 @@ def _evidence_deny_paths(ctx: ToolContext) -> list[str]:
     """Paths evidence may never attach, whatever root the caller declares (C-06): the runtime
     data plane and the live settings file are a boundary, not a heuristic — an operator subject
     root one level above them would otherwise make owner credentials reviewable."""
-    from ouroboros import config as _config
+    from ouroboros.tools.plan_work_items import evidence_deny_paths
 
-    out: list[str] = []
-    for value in (getattr(_config, "SETTINGS_PATH", ""), getattr(_config, "DATA_DIR", "")):
-        text = str(value or "").strip()
-        if text:
-            out.append(text)
-    try:
-        from ouroboros.tool_access import canonical_data_root
-
-        drive = canonical_data_root(ctx)
-        if drive:
-            out.append(str(drive))
-    except Exception:
-        pass
-    return out
-
-
-def _plan_fingerprint(goal: str, plan: str, spec: dict, manifest_hash: str, constitutional: bool) -> str:
-    """Identity of one review request (F4): goal, prose, canonical spec, evidence identity,
-    the constitutional fact — never the exploration log (it changes no obligation)."""
-    payload = {"goal": goal, "plan": plan, "spec": spec, "evidence_manifest_hash": manifest_hash,
-               "constitutional": bool(constitutional)}
-    return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    return evidence_deny_paths(ctx)
 
 
 def _task_evidence_reader(root: pathlib.Path) -> Callable[[str], Optional[str]]:
@@ -517,7 +515,9 @@ def _prepare_plan_inputs(ctx: ToolContext, request: "_PlanRequest", state_root: 
         manifest.setdefault("omissions", []).extend(
             {"locator": loc, "reason": "reviewer_request_cap"} for loc in request_dropped)
     manifest_hash = plan_evidence.evidence_manifest_hash(manifest)
-    fingerprint = _plan_fingerprint(spec["goal"], request.plan, spec, manifest_hash, constitutional)
+    from ouroboros.tools.plan_work_items import plan_fingerprint
+
+    fingerprint = plan_fingerprint(spec["goal"], request.plan, spec, manifest_hash, constitutional)
     return {
         "spec": spec, "system_root": system_root, "active_root": active_root,
         "constitutional": constitutional, "constitutional_note": constitutional_note,

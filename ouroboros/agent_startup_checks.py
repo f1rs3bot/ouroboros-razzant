@@ -1043,17 +1043,25 @@ def verify_restart(env: Any, git_sha: str) -> None:
         tx_history.append(dict(tx))
         campaign["transaction_history"] = tx_history[-50:]
 
-    def _close_post_task_backlog(campaign: Dict[str, Any]) -> None:
-        backlog_id = str(campaign.get("post_task_backlog_id") or "").strip()
-        if not backlog_id:
-            return
-        try:
-            from ouroboros.improvement_backlog import close_backlog_items
+    def _close_post_task_backlog(campaign: Dict[str, Any], tx: Optional[Dict[str, Any]] = None) -> None:
+        tx = tx if isinstance(tx, dict) else (
+            campaign.get("active_transaction") if isinstance(campaign.get("active_transaction"), dict) else {}
+        )
+        binding = None
+        legacy_id = str(campaign.get("post_task_backlog_id") or "").strip()
+        if isinstance(tx, dict):
+            from ouroboros.tools.plan_work_items import transaction_work_item_binding
 
-            drive_root = getattr(env, "drive_root", None) or env.drive_path("memory").parent
-            close_backlog_items(drive_root, ids=[backlog_id])
-        except Exception:
-            log.debug("Post-task backlog close-on-absorb failed", exc_info=True)
+            binding = transaction_work_item_binding(tx)
+        refs = [legacy_id] if binding is None and legacy_id else list((binding or {}).get("refs") or [])
+        if refs:
+            try:
+                from ouroboros.improvement_backlog import close_backlog_items
+
+                drive_root = getattr(env, "drive_root", None) or env.drive_path("memory").parent
+                close_backlog_items(drive_root, ids=refs)
+            except Exception:
+                log.debug("Work-item backlog close-on-absorb failed", exc_info=True)
         campaign.pop("post_task_backlog_id", None)
 
     def _commit_reachable(commit_sha: str, observed_sha: str) -> bool:
@@ -1231,7 +1239,7 @@ def verify_restart(env: Any, git_sha: str) -> None:
                         tx["absorbed_counted"] = True
                     _append_unique_transaction(campaign, tx)
                     campaign.pop("active_transaction", None)
-                    _close_post_task_backlog(campaign)
+                    _close_post_task_backlog(campaign, tx)
                     from supervisor.evolution_lifecycle import _clear_objective_repeat_count
                     _clear_objective_repeat_count(campaign, tx)  # BUG3: absorb clears this fp
                     campaign["progress_notes"] = (
@@ -1403,7 +1411,7 @@ def verify_restart(env: Any, git_sha: str) -> None:
                 # commit is restart-verified and absorbed — mark the promoted backlog
                 # item done. Doing this earlier (at commit_sha time) could close an
                 # item whose commit later fails restart verification.
-                _close_post_task_backlog(campaign)
+                _close_post_task_backlog(campaign, tx)
                 from supervisor.evolution_lifecycle import _clear_objective_repeat_count
                 _clear_objective_repeat_count(campaign, tx)  # BUG3: absorb clears this fp
                 campaign["progress_notes"] = (

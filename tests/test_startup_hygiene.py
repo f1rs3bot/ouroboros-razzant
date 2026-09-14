@@ -261,26 +261,57 @@ def test_verify_restart_closes_promoted_backlog_only_on_absorb(tmp_path):
 
     (tmp_path / "state").mkdir(parents=True)
     (tmp_path / "logs").mkdir(parents=True)
-    ib.append_backlog_items(tmp_path, [{
-        "summary": "promoted fix", "category": "c", "source": "post_task",
-        "evidence": "e", "fingerprint": "fp-x", "id": "ibl-x",
-    }])
+    ib.append_backlog_items(tmp_path, [
+        {"summary": "promoted fix", "category": "c", "source": "post_task",
+         "evidence": "e", "fingerprint": "fp-x", "id": "ibl-x"},
+        {"summary": "modern binding", "category": "c", "source": "plan_task",
+         "evidence": "e", "fingerprint": "fp-y", "id": "ibl-y"},
+    ])
     (tmp_path / "state" / "pending_restart_verify.json").write_text(
         json.dumps({"expected_sha": "goodsha"}), encoding="utf-8")
     (tmp_path / "state" / "evolution_campaign.json").write_text(json.dumps({
         "status": "active",
         "post_task_backlog_id": "ibl-x",
-        "active_transaction": {"transaction_id": "tx1", "task_id": "t1", "commit_sha": "goodsha"},
+        "active_transaction": {
+            "transaction_id": "tx1", "task_id": "t1", "commit_sha": "goodsha",
+            "commit_intent": {"work_item_binding": {
+                "plan_fingerprint": "f" * 64, "refs": ["ibl-y"],
+            }},
+        },
     }), encoding="utf-8")
     env = types.SimpleNamespace(drive_path=lambda rel: tmp_path / rel, drive_root=tmp_path)
 
     startup_mod.verify_restart(env, "goodsha")  # sha matches -> absorbed
 
     by_id = {i["id"]: i for i in ib.load_backlog_items(tmp_path)}
-    assert by_id["ibl-x"]["status"] == "done"  # closed only after absorb
+    assert by_id["ibl-y"]["status"] == "done"  # modern commit-bound ref closes
+    assert by_id["ibl-x"]["status"] == "open"  # explicit modern binding suppresses legacy
     camp = json.loads((tmp_path / "state" / "evolution_campaign.json").read_text(encoding="utf-8"))
     assert "post_task_backlog_id" not in camp
     assert int(camp.get("absorbed_cycles_done") or 0) == 1
+
+
+def test_verify_restart_legacy_backlog_link_still_closes_without_modern_binding(tmp_path):
+    import ouroboros.improvement_backlog as ib
+
+    (tmp_path / "state").mkdir(parents=True)
+    (tmp_path / "logs").mkdir(parents=True)
+    ib.append_backlog_items(tmp_path, [{
+        "summary": "legacy promoted fix", "category": "c", "source": "post_task",
+        "evidence": "e", "fingerprint": "fp-legacy", "id": "ibl-legacy",
+    }])
+    (tmp_path / "state" / "pending_restart_verify.json").write_text(
+        json.dumps({"expected_sha": "goodsha"}), encoding="utf-8")
+    (tmp_path / "state" / "evolution_campaign.json").write_text(json.dumps({
+        "status": "active",
+        "post_task_backlog_id": "ibl-legacy",
+        "active_transaction": {"transaction_id": "tx1", "task_id": "t1", "commit_sha": "goodsha"},
+    }), encoding="utf-8")
+    env = types.SimpleNamespace(drive_path=lambda rel: tmp_path / rel, drive_root=tmp_path)
+
+    startup_mod.verify_restart(env, "goodsha")
+
+    assert ib.load_backlog_items(tmp_path)[0]["status"] == "done"
 
 
 def test_verify_restart_absorb_persists_cycle_outcome_and_owner_report(tmp_path):

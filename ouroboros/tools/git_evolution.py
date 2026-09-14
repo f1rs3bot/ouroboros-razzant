@@ -90,7 +90,7 @@ def _check_evolution_commit_stage(
     )
     if authority.get("ok"):
         if phase == "pre_commit_authority":
-            _git()._record_evolution_commit_intent(claim, fingerprint or {})
+            _git()._record_evolution_commit_intent(ctx, claim, fingerprint or {})
         return claim, ""
     reason = authority.get("reason") or "unknown"
     if phase == "pre_review_authority":
@@ -126,7 +126,7 @@ def _check_evolution_commit_stage(
     return claim, message
 
 
-def _record_evolution_commit_intent(claim: Dict[str, str], fingerprint: Dict[str, Any]) -> None:
+def _record_evolution_commit_intent(ctx: ToolContext, claim: Dict[str, str], fingerprint: Dict[str, Any]) -> None:
     """Write the pre-commit intent: the exact material the commit is about to create.
 
     Phase one of the two-phase reviewed commit. ``git commit`` and the SHA
@@ -141,11 +141,24 @@ def _record_evolution_commit_intent(claim: Dict[str, str], fingerprint: Dict[str
     if not isinstance(binding, dict):
         return
     from supervisor.evolution_lifecycle import update_evolution_transaction
+    from ouroboros.task_results import load_plan_review_state
+    from ouroboros.tools.plan_work_items import plan_work_item_binding
 
+    optional = {}
+    try:
+        state = load_plan_review_state(
+            getattr(ctx, "drive_root", None), str(getattr(ctx, "task_id", "") or ""),
+        )
+        work_item = plan_work_item_binding(state)
+        if work_item is not None:
+            optional["work_item_binding"] = work_item
+    except Exception:
+        optional = {}
     ok = update_evolution_transaction(claim.get("task_id", ""), commit_intent={
         "tree_sha": str(binding.get("tree_sha") or ""),
         "parents": [str(value) for value in (binding.get("parents") or [])],
         "transaction_id": str(claim.get("transaction_id") or ""),
+        **optional,
     })
     if not ok:
         log.warning(

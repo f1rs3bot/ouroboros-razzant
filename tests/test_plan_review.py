@@ -512,7 +512,7 @@ class TestPlanReviewToolRegistration(unittest.TestCase):
         spec = params["spec"]["properties"]
         self.assertEqual(set(spec), {
             "in_scope", "non_goals", "acceptance_claims", "invariants", "decisions",
-            "deferred", "affected_resources", "evidence",
+            "deferred", "affected_resources", "evidence", "work_item_refs",
         })
         disposition = params["review_disposition"]
         self.assertEqual(disposition["required"], ["review_fingerprint", "items"])

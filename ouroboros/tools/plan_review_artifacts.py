@@ -386,6 +386,9 @@ def record_exact_wave(
     )
     wave["spec_source_ref"] = source
     exact = {**exact, "spec_source_ref": source}
+    if "work_item_refs" in wave["spec"]:
+        wave["work_item_refs"] = list(wave["spec"].get("work_item_refs") or [])
+        exact["work_item_refs"] = list(wave["spec"].get("work_item_refs") or [])
     wave["wave_artifact"] = persist_wave(state_root, task_id, exact)
     stored = record_plan_review_wave(
         state_root, task_id, hot_index_wave(wave, page_size=page_size),
