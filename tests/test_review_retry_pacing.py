@@ -140,3 +140,30 @@ def test_logical_deadline_during_wait_prevents_second_physical_send(tmp_path, mo
     assert result.actors[0]["status"] == "error"
     assert result.actors[0]["error"] == "transient timeout"
     assert result.actors[0]["usage"]["review_retry_stop_reason"] == "deadline"
+
+
+def test_logical_deadline_before_wait_prevents_sleep_and_second_send(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr("ouroboros.review_substrate.monotonic_now", lambda: 10.0)
+    monkeypatch.setattr(
+        "ouroboros.review_custody.monotonic_now", lambda _slot_id="": 10.0,
+    )
+    monkeypatch.setattr(
+        "ouroboros.loop_transport.interruptible_wait_sleep",
+        Mock(side_effect=AssertionError("deadline must stop before retry sleep")),
+    )
+    llm = Mock()
+    llm.chat.side_effect = TimeoutError("transient timeout")
+
+    result = run_review_request(
+        _request("pre-wait-deadline"),
+        slots=[ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=1.0)],
+        drive_root=tmp_path,
+        llm=llm,
+    )
+
+    assert llm.chat.call_count == 1
+    assert result.actors[0]["status"] == "error"
+    assert result.actors[0]["error"] == "transient timeout"
+    assert result.actors[0]["usage"]["review_retry_stop_reason"] == "deadline"

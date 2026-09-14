@@ -33,9 +33,17 @@ class _MixedReviewTruthLLM:
         }
 
 
-def test_review_actor_truth_separates_transport_parse_and_semantics(tmp_path):
+def test_review_actor_truth_separates_transport_parse_and_semantics(
+    tmp_path, monkeypatch,
+):
+    from ouroboros.loop_llm_call import _retry_backoff_sec
     from ouroboros.review_substrate import compact_review_projection
 
+    waits = []
+    monkeypatch.setattr(
+        "ouroboros.loop_transport.interruptible_wait_sleep",
+        lambda seconds, wake_check: waits.append(seconds) or False,
+    )
     result = run_review_request(
         ReviewRequest(
             surface="task_acceptance", goal="g", subject="candidate",
@@ -50,6 +58,7 @@ def test_review_actor_truth_separates_transport_parse_and_semantics(tmp_path):
         llm=_MixedReviewTruthLLM(),
     )
     actors = {actor["slot_id"]: actor for actor in result.actors}
+    assert waits == [_retry_backoff_sec({}, "provider_transient", 0, True)]
     assert result.panel_id.startswith("panel_")
     assert len(result.panel_id) == len("panel_") + 16
     assert actors["timeout"]["transport_status"] == "timeout"
