@@ -191,6 +191,49 @@ def review_usage_category(surface: str) -> str:
     return f"{surface}_review"
 
 
+def _review_retry_wait_outcome(
+    usage_ctx: Any, logical_deadline_monotonic: Optional[float],
+) -> str:
+    """Pace one already-authorized review resend without widening its rail.
+
+    The main-loop backoff function owns the initial transient delay, while the
+    transport wait owns interruptible sleeping.  Review keeps only the policy
+    decision that its one retryable-exception resend uses those primitives.
+    Empty-output and format-repair resends never call this seam.
+    """
+    if review_retry_cancelled(usage_ctx):
+        return "cancelled"
+    now = monotonic_now()
+    if logical_deadline_monotonic is not None and now >= logical_deadline_monotonic:
+        return "deadline"
+
+    from ouroboros.loop_llm_call import _retry_backoff_sec
+    from ouroboros.loop_transport import interruptible_wait_sleep
+
+    delay = _retry_backoff_sec({}, "provider_transient", 0, True)
+    if (
+        logical_deadline_monotonic is not None
+        and logical_deadline_monotonic - now < delay
+    ):
+        return "deadline"
+
+    interrupted = interruptible_wait_sleep(
+        delay,
+        lambda: review_retry_cancelled(usage_ctx) or (
+            logical_deadline_monotonic is not None
+            and monotonic_now() >= logical_deadline_monotonic
+        ),
+    )
+    if review_retry_cancelled(usage_ctx):
+        return "cancelled"
+    if (
+        logical_deadline_monotonic is not None
+        and monotonic_now() >= logical_deadline_monotonic
+    ):
+        return "deadline"
+    return "interrupted" if interrupted else "ready"
+
+
 class ReviewCoordinator:
     def __init__(
         self,
@@ -625,10 +668,14 @@ class ReviewCoordinator:
                         if not retryable_review_exception(exc, self.usage_ctx, attempt_history):
                             raise
                         if actor_attempt + 1 < actor_attempts:
-                            if (
-                                logical_deadline_monotonic is not None
-                                and monotonic_now() >= logical_deadline_monotonic
-                            ):
+                            wait_outcome = _review_retry_wait_outcome(
+                                self.usage_ctx, logical_deadline_monotonic,
+                            )
+                            if wait_outcome != "ready":
+                                try:
+                                    setattr(exc, "review_retry_stop_reason", wait_outcome)
+                                except Exception:
+                                    pass
                                 raise
                             continue
                         if _has_prior:

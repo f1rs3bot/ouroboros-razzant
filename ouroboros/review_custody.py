@@ -119,6 +119,11 @@ def _review_exception_projection(
     from ouroboros.usage_accounting import BudgetExceeded, UsageAccountingError
 
     failure_custody = dict(executor_custody or {})
+    retry_stop_reason = str(
+        getattr(exc, "review_retry_stop_reason", "") or ""
+    ).strip()
+    if retry_stop_reason in {"cancelled", "deadline", "interrupted"}:
+        failure_custody["review_retry_stop_reason"] = retry_stop_reason
     capture = getattr(exc, "physical_attempt_capture", None)
     capture_state = str(getattr(capture, "state", "") or "").strip().lower()
     malformed_capture = bool(

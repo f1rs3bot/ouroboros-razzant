@@ -737,7 +737,11 @@ def test_review_substrate_degraded_quorum_carries_reason(tmp_path):
     assert any("quorum_not_met" in reason for reason in result.degraded_reasons)
 
 
-def test_p3_commit_actor_retries_same_slot_model_once_then_blocks(tmp_path):
+def test_p3_commit_actor_retries_same_slot_model_once_then_blocks(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "ouroboros.loop_transport.interruptible_wait_sleep",
+        lambda _seconds, wake_check: False,
+    )
     recovered_llm = Mock()
     recovered_llm.chat.side_effect = [
         TimeoutError("transient timeout"),
