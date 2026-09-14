@@ -423,7 +423,8 @@ def _is_path_locator(locator: str) -> bool:
 
 def _resolve_locator_path(locator: str, root: pathlib.Path) -> tuple[Optional[pathlib.Path], str]:
     """Relative → under ``root``; absolute (or ``file://`` absolute) as-is. Returns
-    ``(path, "")`` or ``(None, reason)`` — ``symlink_loop`` (RuntimeError from resolve) or
+    ``(path, "")`` or ``(None, reason)`` — ``symlink_loop`` (RuntimeError from resolve on
+    ≤3.12; on 3.13 the loop survives resolve and is classified at stat downstream) or
     ``unsupported_locator`` (NUL bytes, over-long components, …). Never raises."""
     if locator.startswith(_FILE_SCHEME):
         locator = locator[len(_FILE_SCHEME):]

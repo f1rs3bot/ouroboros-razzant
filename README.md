@@ -12,7 +12,7 @@
 [![Linux](https://img.shields.io/badge/Linux-x86__64-orange.svg)](https://ouroboros-agent.ai/install/#linux)
 [![Windows](https://img.shields.io/badge/Windows-x64-blue.svg)][download-windows-x64]
 [![OuroborosHub](https://img.shields.io/badge/OuroborosHub-skills%20marketplace-8A2BE2.svg)](https://github.com/razzant/OuroborosHub)
-[![Version 7.0.10](https://img.shields.io/badge/version-7.0.10-green.svg)](VERSION)
+[![Version 7.0.11](https://img.shields.io/badge/version-7.0.11-green.svg)](VERSION)
 
 Ouroboros is an open-source, general-purpose AI agent whose identity, durable memory, and history continue across tasks and restarts. It works on external projects, coordinates a live swarm of specialist agents, and can rewrite the implementation it runs on, including its code, architecture, prompts, tools, and dependencies. Reflection can also change how it understands itself without severing that continuity.
 
@@ -64,13 +64,13 @@ The desktop packages already contain an optional CLI installer. On macOS, after 
 
 </details>
 
-[download-macos-arm64]: https://github.com/razzant/ouroboros/releases/download/v7.0.10/Ouroboros-7.0.10.dmg
-[download-windows-x64]: https://github.com/razzant/ouroboros/releases/download/v7.0.10/Ouroboros-7.0.10-windows-x64.zip
-[download-linux-deb-amd64]: https://github.com/razzant/ouroboros/releases/download/v7.0.10/ouroboros_7.0.10_amd64.deb
-[download-linux-rpm-x86_64]: https://github.com/razzant/ouroboros/releases/download/v7.0.10/ouroboros-7.0.10-1.x86_64.rpm
-[download-linux-rpm-red80-x86_64]: https://github.com/razzant/ouroboros/releases/download/v7.0.10/ouroboros-7.0.10-1.red80.x86_64.rpm
-[download-linux-appimage-x86_64]: https://github.com/razzant/ouroboros/releases/download/v7.0.10/Ouroboros-7.0.10-linux-x86_64.AppImage
-[download-linux-x86_64]: https://github.com/razzant/ouroboros/releases/download/v7.0.10/Ouroboros-7.0.10-linux-x86_64.tar.gz
+[download-macos-arm64]: https://github.com/razzant/ouroboros/releases/download/v7.0.11/Ouroboros-7.0.11.dmg
+[download-windows-x64]: https://github.com/razzant/ouroboros/releases/download/v7.0.11/Ouroboros-7.0.11-windows-x64.zip
+[download-linux-deb-amd64]: https://github.com/razzant/ouroboros/releases/download/v7.0.11/ouroboros_7.0.11_amd64.deb
+[download-linux-rpm-x86_64]: https://github.com/razzant/ouroboros/releases/download/v7.0.11/ouroboros-7.0.11-1.x86_64.rpm
+[download-linux-rpm-red80-x86_64]: https://github.com/razzant/ouroboros/releases/download/v7.0.11/ouroboros-7.0.11-1.red80.x86_64.rpm
+[download-linux-appimage-x86_64]: https://github.com/razzant/ouroboros/releases/download/v7.0.11/Ouroboros-7.0.11-linux-x86_64.AppImage
+[download-linux-x86_64]: https://github.com/razzant/ouroboros/releases/download/v7.0.11/Ouroboros-7.0.11-linux-x86_64.tar.gz
 
 Ouroboros bundles [Claudexor](https://github.com/razzant/claudexor) as its local execution layer for delegated coding and hosted-agent review. Ouroboros owns the task, memory, review, and final integration, while Claudexor runs the selected connected coding harness and returns durable execution evidence. [Explore Claudexor](https://claudexor.ai/).
 
@@ -449,6 +449,7 @@ and the reason.
 
 | Version | Date | Description |
 |---------|------|-------------|
+| 7.0.11 | 2026-09-14 | **fix: the release test gate passes on Python 3.13 and root hosts.** Host-environment drift kept the hermetic preflight permanently red through five independent classes. PEP 709 (Python ≥3.12) inlines list/set/dict comprehensions, so `symtable` emits no child scope for them and their targets are locals of the enclosing scope — the v7next transplant walker now keeps the enclosing scope for those node types (generator expressions keep their own table) while the fail-closed scope-alignment guard still catches genuine exotic constructs. On 3.13 `Path.resolve(strict=False)` silently returns a symlink-loop path, so a looped manifest-declared skill entry was silently excluded from the review-content hash and the RC audit reported STALE instead of the pinned blocking finding — the declared-entry resolution now uses `resolve(strict=True)` (OSError on 3.13, RuntimeError on older, both mapped by the audit), while a dangling/absent entry keeps its silent skip; and the plan-evidence path classifier maps an ELOOP stat failure to the documented `symlink_loop` reason again instead of plain `unreadable`. Two fixtures also assumed a non-root host: the archive-corruption test's `chmod(0o111)` is a no-op for euid 0, so under root it now injects the same EACCES at the anchor `os.open` — exercising the real production OSError→typed-corruption mapping rather than skipping the coverage; and the nondumpable-stranger containment test expected `unreadable`, but root's `CAP_SYS_PTRACE` reads the environment fine, so the stranger is correctly answered-not-a-member (`absent`) — the assertion now pins the verified per-euid contract while the safety property (a stranger never blocks a reap and is never signalled) is asserted on both paths. |
 | 7.0.10 | 2026-09-13 | **fix: focused pytest runs no longer inherit the owner's review-cycle cap.** The test environment scrub now removes `OUROBOROS_REVIEW_MAX_CYCLES` alongside the other exported runtime controls, and a regression pins the fixture wiring. Acceptance pacing still honors the owner-selected `cycles − 1` contract; only ambient process leakage is isolated. |
 | 7.0.9 | 2026-09-13 | **fix: leaked model-control output is quarantined before owner delivery.** An observed provider failure returned a huge malformed generation beginning with the literal `<&#124;close&#124;>` and the task pipeline published it as ordinary model speech. The narrow integrity boundary now rejects only that leading literal after whitespace, preserves the exact UTF-8 bytes privately under a SHA-256-addressed observability path, and exposes a typed host notice plus failed outcome instead. Rejection state belongs to the exact `DeliveryCandidate`, so a delivery hold followed by a clean replacement cannot inherit it; ordinary, forced, replay, parent-reader and Presence paths share the same terminal projection, with a final pipeline backstop before outcome derivation and persistence. Quoted, fenced, embedded, and other token strings remain ordinary model text. |
 | 7.0.8 | 2026-09-13 | **fix: OpenAI-compatible routes carry the configured reasoning effort.** The saved task/review effort already reached the provider boundary, but the generic Chat Completions builder serialized it only for direct OpenAI and DeepSeek, so codex-lb received no effort carrier at all. `openai-compatible::` now sends normalized top-level `reasoning_effort` beside `max_tokens`; the existing exact-route request-wire recovery still adapts and discloses an endpoint rejection. Local construction tests prove carriage and recovery without touching account credentials; whether an opaque proxy honors an accepted tier remains endpoint-owned evidence, not something inferred from token counts or a `default` UI label. |

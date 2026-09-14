@@ -502,15 +502,23 @@ def test_unrelated_nondumpable_process_does_not_block_or_receive_a_signal(monkey
     signals = []
     try:
         assert stranger.stdout.readline().strip() == "ready"
-        assert process_containment.pid_marker_state(stranger.pid, container._token) == process_containment.MARKER_UNREADABLE
+        if os.geteuid() == 0:
+            # CAP_SYS_PTRACE reads even a nondumpable environ, so under root the
+            # stranger is ANSWERED-not-a-member (verified on Linux 6.18: the open
+            # succeeds and the token is legitimately not there) — never
+            # "unreadable", and the disclosure warning has nothing to disclose.
+            assert process_containment.pid_marker_state(stranger.pid, container._token) == process_containment.MARKER_ABSENT
+        else:
+            assert process_containment.pid_marker_state(stranger.pid, container._token) == process_containment.MARKER_UNREADABLE
         root.stdin.close()
         root.wait(timeout=10)
         monkeypatch.setattr(process_containment._pl, "force_kill_pid", lambda pid: signals.append(pid))
         assert container.reap() == ""
         assert stranger.poll() is None
         assert stranger.pid not in signals
-        assert "Unattributed processes have unreadable environments" in caplog.text
-        assert str(stranger.pid) in caplog.text
+        if os.geteuid() != 0:
+            assert "Unattributed processes have unreadable environments" in caplog.text
+            assert str(stranger.pid) in caplog.text
     finally:
         container.close()
         if not root.stdin.closed:

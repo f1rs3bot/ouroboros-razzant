@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import codecs
 import ast
+import errno
 from hashlib import sha256
 import pathlib
 import re
@@ -210,13 +211,16 @@ def _read_evidence(
 
 
 def _path_kind(path: pathlib.Path) -> str:
-    """``missing`` · ``directory`` · ``file`` (regular) · ``unreadable`` (stat failure or a
-    non-regular node: fifo/device/socket would block or never end a read)."""
+    """``missing`` · ``directory`` · ``file`` (regular) · ``symlink_loop`` (ELOOP at stat —
+    on 3.13 the non-strict resolver no longer raises on a loop) · ``unreadable`` (other stat
+    failure or a non-regular node: fifo/device/socket would block or never end a read)."""
     try:
         mode = path.stat().st_mode
     except FileNotFoundError:
         return "missing"
-    except (OSError, ValueError, RuntimeError):
+    except OSError as exc:
+        return "symlink_loop" if exc.errno == errno.ELOOP else "unreadable"
+    except (ValueError, RuntimeError):
         return "unreadable"
     if stat.S_ISDIR(mode):
         return "directory"

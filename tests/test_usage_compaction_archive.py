@@ -320,12 +320,29 @@ def test_an_archive_entry_the_anchor_cannot_open_is_typed_corruption(data_root, 
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous)
     if held_dir_fd:  # the root handle is opened only on the dir-fd shape
-        data_root.chmod(0o111)  # traversable, unreadable: fd exhaustion reads the same
-        try:
-            with pytest.raises(UsageLedgerCorrupt):
-                uc.archived_attempt_ids(data_root)
-        finally:
-            data_root.chmod(0o755)
+        if os.geteuid() == 0:
+            # Permission bits do not stop euid 0, so chmod cannot produce the
+            # anchor-open failure here. Inject the same EACCES at the anchor
+            # os.open instead — this still exercises the real production
+            # mapping inside _archive_dir_fds (OSError -> UsageLedgerCorrupt).
+            real_open = os.open
+
+            def _deny_root_open(path, flags, *args, **kwargs):
+                if str(path) == str(data_root):
+                    raise OSError(errno.EACCES, "injected: root bypasses permission bits")
+                return real_open(path, flags, *args, **kwargs)
+
+            with monkeypatch.context() as m:  # scoped: the dangling-link check below needs os.open back
+                m.setattr(os, "open", _deny_root_open)
+                with pytest.raises(UsageLedgerCorrupt):
+                    uc.archived_attempt_ids(data_root)
+        else:
+            data_root.chmod(0o111)  # traversable, unreadable: fd exhaustion reads the same
+            try:
+                with pytest.raises(UsageLedgerCorrupt):
+                    uc.archived_attempt_ids(data_root)
+            finally:
+                data_root.chmod(0o755)
     planted = archive_dir / "segment_ep0009_planted.jsonl"
     planted.symlink_to(data_root / "nowhere.jsonl")  # dangling: unopenable either way
     with pytest.raises(UsageLedgerCorrupt, match="could not complete"):

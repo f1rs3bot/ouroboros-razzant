@@ -328,8 +328,10 @@ def _iter_payload_files(
     except metadata/cache/sensitive paths, lifecycle control files
     (``HASH_EXEMPT_CONTROL_FILENAMES``), and symlink escapes. Manifest entry
     points are re-added only when confined, keeping executable and reviewed
-    surfaces aligned. ``include_control_files=True`` reproduces the legacy
-    pre-v6.31 hash (control files included) for one-shot state migration.
+    surfaces aligned; a declared entry with a symlink LOOP instead fails the
+    hash (``resolve(strict=True)`` — the non-strict resolver swallows loops on 3.13).
+    ``include_control_files=True`` reproduces the legacy pre-v6.31 hash
+    (control files included) for one-shot state migration.
     """
     out: List[pathlib.Path] = []
     resolved_root = skill_dir.resolve()
@@ -344,11 +346,11 @@ def _iter_payload_files(
             return
         if ".." in pathlib.PurePosixPath(rel).parts:
             return
-        resolved = (skill_dir / rel).resolve()
-        try:
+        try:  # strict resolve: a symlink LOOP in a declared entry raises, never a silent skip
+            resolved = (skill_dir / rel).resolve(strict=True)
             resolved.relative_to(resolved_root)
-        except ValueError:
-            return
+        except (FileNotFoundError, ValueError):
+            return  # a dangling entry or an escape keeps the historical silent skip
         if resolved.is_file():
             _add(resolved)
 

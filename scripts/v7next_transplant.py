@@ -413,7 +413,14 @@ class _Walker:
         if type(node) in _COMP_NAMES:
             gens = node.generators
             self._visit(gens[0].iter, scope, calltime)  # outermost iterable: enclosing scope
-            inner = scope.enter(_COMP_NAMES[type(node)], node.lineno)
+            if sys.version_info >= (3, 12) and type(node) is not ast.GeneratorExp:
+                # PEP 709: list/set/dict comprehensions are inlined into the
+                # enclosing frame — symtable emits no child scope for them and
+                # their targets are locals of the enclosing scope. Only the
+                # (lazily evaluated) generator expression keeps its own table.
+                inner = scope
+            else:
+                inner = scope.enter(_COMP_NAMES[type(node)], node.lineno)
             self._visit(gens[0].target, inner, calltime)
             for cond in gens[0].ifs:
                 self._visit(cond, inner, calltime)
